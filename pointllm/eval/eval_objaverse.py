@@ -9,6 +9,7 @@ from pointllm.model.utils import KeywordsStoppingCriteria
 from pointllm.data import ObjectPointCloudDataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from pointllm.eval.speculative import load_assistant_model, generate_with_speculative_fallback
 from pointllm.eval.evaluator import start_evaluation
 
 import os
@@ -31,12 +32,13 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = PointLLMLlamaForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=False, use_cache=True, torch_dtype=torch.bfloat16).cuda()
     model.initialize_tokenizer_point_backbone_config_wo_embedding(tokenizer)
+    assistant_model = load_assistant_model(args.assistant_model_name, torch.bfloat16)
 
     conv_mode = "vicuna_v1_1"
 
     conv = conv_templates[conv_mode].copy()
 
-    return model, tokenizer, conv
+    return model, tokenizer, conv, assistant_model
 
 def load_dataset(data_path, anno_path, pointnum, conversation_types, use_color):
     print("Loading validation datasets.")
@@ -55,10 +57,11 @@ def get_dataloader(dataset, batch_size, shuffle=False, num_workers=4):
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
     return dataloader
 
-def generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteria, do_sample=True, temperature=1.0, top_k=50, max_length=2048, top_p=0.95):
+def generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteria, do_sample=True, temperature=1.0, top_k=50, max_length=2048, top_p=0.95, assistant_model=None, num_assistant_tokens=8, assistant_confidence_threshold=0.4):
     model.eval() 
     with torch.inference_mode():
-        output_ids = model.generate(
+        output_ids = generate_with_speculative_fallback(
+            model,
             input_ids,
             point_clouds=point_clouds,
             do_sample=do_sample,
@@ -66,7 +69,11 @@ def generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteri
             top_k=top_k,
             max_length=max_length,
             top_p=top_p,
-            stopping_criteria=[stopping_criteria]) # * B, L'
+            stopping_criteria=stopping_criteria,
+            assistant_model=assistant_model,
+            num_assistant_tokens=num_assistant_tokens,
+            assistant_confidence_threshold=assistant_confidence_threshold,
+        ) # * B, L'
 
     input_token_len = input_ids.shape[1]
     n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
@@ -77,7 +84,7 @@ def generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteri
 
     return outputs
 
-def start_generation(model, tokenizer, conv, dataloader, annos, prompt_index, output_dir, output_file):
+def start_generation(model, tokenizer, conv, dataloader, annos, prompt_index, output_dir, output_file, assistant_model=None, num_assistant_tokens=8, assistant_confidence_threshold=0.4):
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     qs = PROMPT_LISTS[prompt_index]
 
@@ -115,7 +122,7 @@ def start_generation(model, tokenizer, conv, dataloader, annos, prompt_index, ou
 
         input_ids = input_ids_.repeat(batchsize, 1) # * tensor of B, L
 
-        outputs = generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteria) # List of str, length is B
+        outputs = generate_outputs(model, tokenizer, input_ids, point_clouds, stopping_criteria, assistant_model=assistant_model, num_assistant_tokens=num_assistant_tokens, assistant_confidence_threshold=assistant_confidence_threshold) # List of str, length is B
 
         # saving results
         for obj_id, output in zip(object_ids, outputs):
@@ -156,17 +163,19 @@ def main(args):
         dataset = load_dataset(args.data_path, args.anno_path, args.pointnum, ("simple_description",), args.use_color)
         dataloader = get_dataloader(dataset, args.batch_size, args.shuffle, args.num_workers)
         
-        model, tokenizer, conv = init_model(args)
+        model, tokenizer, conv, assistant_model = init_model(args)
 
         # * convert annos file from [{"object_id": }] to {"object_id": }
         annos = {anno["object_id"]: anno["conversations"][1]['value'] for anno in annos}
 
         print(f'[INFO] Start generating results for {args.output_file}.')
-        results = start_generation(model, tokenizer, conv, dataloader, annos, args.prompt_index, args.output_dir, args.output_file)
+        results = start_generation(model, tokenizer, conv, dataloader, annos, args.prompt_index, args.output_dir, args.output_file, assistant_model=assistant_model, num_assistant_tokens=args.num_assistant_tokens, assistant_confidence_threshold=args.assistant_confidence_threshold)
 
         # * release model and tokenizer, and release cuda memory
         del model
         del tokenizer
+        if assistant_model is not None:
+            del assistant_model
         torch.cuda.empty_cache()
     else:
         # * directly load the results
@@ -203,6 +212,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_eval", action="store_true", default=False)
     parser.add_argument("--gpt_type", type=str, default="gpt-4-0613", choices=["gpt-3.5-turbo-0613", "gpt-3.5-turbo-1106", "gpt-4-0613", "gpt-4-1106-preview"], help="Type of the model used to evaluate.")
     parser.add_argument("--task_type", type=str, default="captioning", choices=["captioning", "classification"], help="Type of the task to evaluate.")
+
+    parser.add_argument("--assistant_model_name", type=str, default=None, help="Draft model name/path for speculative decoding.")
+    parser.add_argument("--num_assistant_tokens", type=int, default=8, help="How many draft tokens to propose per step in speculative decoding.")
+    parser.add_argument("--assistant_confidence_threshold", type=float, default=0.4, help="Confidence threshold for assistant acceptance in speculative decoding.")
 
     args = parser.parse_args()
 
