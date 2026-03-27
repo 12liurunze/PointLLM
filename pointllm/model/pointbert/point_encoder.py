@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from timm.models.layers import DropPath
 from .dvae import Group
 from .dvae import Encoder
+from . import misc
 from .logger import print_log
 from collections import OrderedDict
 
@@ -97,6 +99,45 @@ class TransformerEncoder(nn.Module):
             x = block(x + pos)
         return x
 
+class SlotPointTokenizer(nn.Module):
+    """Learnable slot tokenizer for point clouds (non-grouping)."""
+    def __init__(self, point_dims, trans_dim, num_slots, num_heads=8):
+        super().__init__()
+        self.num_slots = num_slots
+        self.point_proj = nn.Sequential(
+            nn.Linear(point_dims, trans_dim),
+            nn.GELU(),
+            nn.Linear(trans_dim, trans_dim),
+        )
+        self.slot_embed = nn.Parameter(torch.randn(1, num_slots, trans_dim) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=trans_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+        self.slot_norm = nn.LayerNorm(trans_dim)
+        self.slot_mlp = nn.Sequential(
+            nn.Linear(trans_dim, trans_dim * 4),
+            nn.GELU(),
+            nn.Linear(trans_dim * 4, trans_dim),
+        )
+        self.out_norm = nn.LayerNorm(trans_dim)
+
+    def forward(self, pts):
+        point_tokens = self.point_proj(pts)  # B N C
+        slots = self.slot_embed.expand(pts.shape[0], -1, -1)
+        attn_out, attn_weights = self.cross_attn(
+            query=slots,
+            key=point_tokens,
+            value=point_tokens,
+            need_weights=True,
+        )
+        slots = self.slot_norm(slots + attn_out)
+        slots = self.out_norm(slots + self.slot_mlp(slots))
+        # center by attention-weighted xyz for positional embedding
+        centers = torch.matmul(attn_weights, pts[:, :, :3].contiguous())  # B G 3
+        return slots, centers
+
 
 class PointTransformer(nn.Module):
     def __init__(self, config, use_max_pool=True):
@@ -114,13 +155,45 @@ class PointTransformer(nn.Module):
         self.group_size = config.group_size
         self.num_group = config.num_group
         self.point_dims = config.point_dims
-        # grouper
-        self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
-        # define the encoder
+        self.tokenizer_type = getattr(config, "tokenizer_type", "group")
+
         self.encoder_dims = config.encoder_dims
-        self.encoder = Encoder(encoder_channel=self.encoder_dims, point_input_dims=self.point_dims)
-        # bridge encoder and transformer
-        self.reduce_dim = nn.Linear(self.encoder_dims, self.trans_dim)
+        if self.tokenizer_type == "group":
+            # default PointBERT grouping tokenizer
+            self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
+            self.encoder = Encoder(encoder_channel=self.encoder_dims, point_input_dims=self.point_dims)
+            self.reduce_dim = nn.Linear(self.encoder_dims, self.trans_dim)
+        elif self.tokenizer_type == "fps_mlp":
+            # alternative tokenizer: FPS center sampling + point-wise MLP tokenization (no local grouping)
+            self.group_divider = None
+            self.encoder = None
+            self.reduce_dim = nn.Sequential(
+                nn.Linear(self.point_dims, self.encoder_dims),
+                nn.GELU(),
+                nn.Linear(self.encoder_dims, self.trans_dim),
+            )
+        elif self.tokenizer_type == "avg_pool_mlp":
+            # alternative tokenizer: adaptive pooling on raw points + MLP tokenization (no FPS/KNN grouping)
+            self.group_divider = None
+            self.encoder = None
+            self.reduce_dim = nn.Sequential(
+                nn.Linear(self.point_dims, self.encoder_dims),
+                nn.GELU(),
+                nn.Linear(self.encoder_dims, self.trans_dim),
+            )
+        elif self.tokenizer_type == "slot_attn":
+            # alternative tokenizer: learnable slots cross-attend to all points
+            self.group_divider = None
+            self.encoder = None
+            self.reduce_dim = None
+            self.slot_tokenizer = SlotPointTokenizer(
+                point_dims=self.point_dims,
+                trans_dim=self.trans_dim,
+                num_slots=self.num_group,
+                num_heads=max(1, min(self.num_heads, self.trans_dim // 32)),
+            )
+        else:
+            raise ValueError(f"Unsupported tokenizer_type: {self.tokenizer_type}")
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
         self.cls_pos = nn.Parameter(torch.randn(1, 1, self.trans_dim))
@@ -167,11 +240,30 @@ class PointTransformer(nn.Module):
             print_log("PointBERT's weights are successfully loaded from {}".format(bert_ckpt_path), logger='Transformer')
 
     def forward(self, pts):
-        # divide the point cloud in the same form. This is important
-        neighborhood, center = self.group_divider(pts)
-        # encoder the input cloud blocks
-        group_input_tokens = self.encoder(neighborhood)  # B G N
-        group_input_tokens = self.reduce_dim(group_input_tokens)
+        if self.tokenizer_type == "group":
+            # divide the point cloud in the same form. This is important for PointBERT pretraining checkpoints
+            neighborhood, center = self.group_divider(pts)
+            # encode the grouped cloud blocks
+            group_input_tokens = self.encoder(neighborhood)  # B G N
+            group_input_tokens = self.reduce_dim(group_input_tokens)
+        elif self.tokenizer_type == "fps_mlp":
+            # use FPS centers as tokens directly (no local grouping)
+            center = misc.fps(pts[:, :, :3].contiguous(), self.num_group)  # B G 3
+            # approximate token features via nearest-point retrieval from sampled centers
+            dist = torch.cdist(center, pts[:, :, :3].contiguous())  # B G N
+            nearest_idx = dist.argmin(dim=-1)  # B G
+            nearest_idx_expand = nearest_idx.unsqueeze(-1).expand(-1, -1, self.point_dims)
+            sampled_points = torch.gather(pts, 1, nearest_idx_expand)  # B G C
+            group_input_tokens = self.reduce_dim(sampled_points)
+        else:  # avg_pool_mlp
+            if self.tokenizer_type == "avg_pool_mlp":
+                # adaptive pooling over raw points to fixed token count (order-sensitive but lightweight)
+                pooled_points = F.adaptive_avg_pool1d(pts.transpose(1, 2), self.num_group).transpose(1, 2)
+                center = pooled_points[:, :, :3]
+                group_input_tokens = self.reduce_dim(pooled_points)
+            else:  # slot_attn
+                group_input_tokens, center = self.slot_tokenizer(pts)
+
         # prepare cls
         cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)
         cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)

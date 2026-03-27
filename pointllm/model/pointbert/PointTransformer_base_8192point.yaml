@@ -7,6 +7,7 @@ model : {
   num_heads: 12,
   group_size: 48, 
   num_group: 512,
+  tokenizer_type: group, # options: group / fps_mlp / avg_pool_mlp / slot_attn
   encoder_dims: 512, # * point group tokens feature
   point_input_dims: 3,
 }

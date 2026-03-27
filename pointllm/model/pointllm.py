@@ -91,13 +91,16 @@ class PointLLMLlamaModel(LlamaModel):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         point_clouds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
         # HACK: replace back original embeddings for pretraining
@@ -109,7 +112,8 @@ class PointLLMLlamaModel(LlamaModel):
         point_backbone = getattr(self, 'point_backbone', None)
         point_backbone_config = getattr(self, 'point_backbone_config', None)
 
-        if point_backbone is not None and (input_ids.shape[1] != 1 or self.training) and point_clouds is not None:
+        should_encode_points = self.training or (input_ids is not None and input_ids.shape[1] != 1)
+        if point_backbone is not None and should_encode_points and point_clouds is not None:
             # * enter when training or the first generation step of inference
             with torch.no_grad() if self.fix_pointnet else nullcontext():
                 if self.fix_pointnet:
@@ -171,9 +175,10 @@ class PointLLMLlamaModel(LlamaModel):
             inputs_embeds = torch.stack(new_input_embeds, dim=0)
 
         return super(PointLLMLlamaModel, self).forward(
-            input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
+            input_ids=None, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values,
             inputs_embeds=inputs_embeds, use_cache=use_cache,
             output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
             return_dict=return_dict
         )
 
@@ -197,6 +202,7 @@ class PointLLMLlamaForCausalLM(LlamaForCausalLM):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -204,7 +210,9 @@ class PointLLMLlamaForCausalLM(LlamaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         point_clouds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -216,13 +224,16 @@ class PointLLMLlamaForCausalLM(LlamaForCausalLM):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            point_clouds=point_clouds
+            point_clouds=point_clouds,
+            cache_position=cache_position,
+            **kwargs,
         )
 
         hidden_states = outputs[0]
@@ -270,6 +281,8 @@ class PointLLMLlamaForCausalLM(LlamaForCausalLM):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "position_ids": kwargs.get("position_ids", None),
+                "cache_position": kwargs.get("cache_position", None),
                 "point_clouds": kwargs.get("point_clouds", None),
             }
         )
