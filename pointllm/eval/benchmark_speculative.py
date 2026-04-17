@@ -81,8 +81,7 @@ def main():
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--draft_model_name", type=str, required=True)
     parser.add_argument("--data_path", type=str, default="data/objaverse_data")
-    parser.add_argument("--object_ids", type=str, nargs="+", required=True, help="List of Objaverse object ids.")
-    parser.add_argument("--question", type=str, default="Please describe this object in detail.")
+    parser.add_argument("--question", type=str, default="What is this object?")
     parser.add_argument(
         "--max_new_tokens",
         type=int,
@@ -129,8 +128,9 @@ def main():
         "accepted_draft_tokens": 0,
         "target_corrections": 0,
     }
-
-    for object_id in args.object_ids:
+    with open("/root/autodl-tmp/pointLLM/data/id_name_map.csv", "r", encoding="utf-8") as f:
+        object_ids = [line.strip().split(",")[0] for line in f.readlines()[1:]]  # skip header
+    for object_id in object_ids:
         point_clouds = load_point_cloud(args.data_path, object_id, torch_dtype)
         prompt, stop_str = build_prompt(model, args.question)
         input_ids = torch.as_tensor(tokenizer([prompt]).input_ids).cuda()

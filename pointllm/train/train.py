@@ -52,7 +52,6 @@ class DataArguments:
     split_ratio: float = field(default=0.9, metadata={"help": "Ratio of train and val."})
     pointnum: int = field(default=8192, metadata={"help": "Number of points."})
     conversation_types: List[str] = field(default_factory=lambda: ["simple_description"], metadata={"help": "Conversation types to use."})
-    skip_missing_files: bool = field(default=True, metadata={"help": "Whether to skip samples whose point cloud file is missing."})
     is_multimodal: bool = True
 
 @dataclass
