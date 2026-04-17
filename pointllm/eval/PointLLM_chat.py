@@ -6,6 +6,7 @@ from pointllm.conversation import conv_templates, SeparatorStyle
 from pointllm.utils import disable_torch_init
 from pointllm.model import *
 from pointllm.model.utils import KeywordsStoppingCriteria
+from pointllm.eval.speculative_decode import speculative_decode
 
 from pointllm.data import load_objaverse_point_cloud
 
@@ -22,7 +23,7 @@ def init_model(args):
     # Model
     disable_torch_init()
 
-    model_path = args.model_path 
+    model_path = args.model_name
     print(f'[INFO] Model name: {model_path}')
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -30,6 +31,18 @@ def init_model(args):
     model.initialize_tokenizer_point_backbone_config_wo_embedding(tokenizer)
 
     model.eval()
+    assistant_model = None
+    if args.draft_model_name is not None:
+        print(f"[INFO] Draft model name: {args.draft_model_name}")
+        assistant_model = PointLLMLlamaForCausalLM.from_pretrained(
+            args.draft_model_name,
+            low_cpu_mem_usage=False,
+            use_cache=True,
+            torch_dtype=args.torch_dtype
+        ).cuda()
+        assistant_model.initialize_tokenizer_point_backbone_config_wo_embedding(tokenizer)
+        assistant_model.eval()
+        print(f"[INFO] Enabled speculative decoding with num_assistant_tokens={args.num_assistant_tokens}.")
 
     mm_use_point_start_end = getattr(model.config, "mm_use_point_start_end", False)
     # Add special tokens ind to model.point_config
@@ -46,9 +59,9 @@ def init_model(args):
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     keywords = [stop_str]
     
-    return model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv
+    return model, assistant_model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv
 
-def start_conversation(args, model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv):
+def start_conversation(args, model, assistant_model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv):
     point_token_len = point_backbone_config['point_token_len']
     default_point_patch_token = point_backbone_config['default_point_patch_token']
     default_point_start_token = point_backbone_config['default_point_start_token']
@@ -109,15 +122,32 @@ def start_conversation(args, model, tokenizer, point_backbone_config, keywords, 
             stop_str = keywords[0]
 
             with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    point_clouds=point_clouds,
-                    do_sample=True,
-                    temperature=1.0,
-                    top_k=50,
-                    max_length=2048,
-                    top_p=0.95,
-                    stopping_criteria=[stopping_criteria])
+                if assistant_model is not None:
+                    output_ids = speculative_decode(
+                        model=model,
+                        assistant_model=assistant_model,
+                        input_ids=input_ids,
+                        point_clouds=point_clouds,
+                        max_length=2048,
+                        eos_token_id=tokenizer.eos_token_id,
+                        num_assistant_tokens=args.num_assistant_tokens,
+                        do_sample=args.do_sample,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        stopping_criteria=[stopping_criteria],
+                    )
+                else:
+                    output_ids = model.generate(
+                        input_ids,
+                        point_clouds=point_clouds,
+                        do_sample=args.do_sample,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        max_length=2048,
+                        top_p=args.top_p,
+                        stopping_criteria=[stopping_criteria],
+                    )
 
             input_token_len = input_ids.shape[1]
             n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
@@ -141,8 +171,20 @@ if __name__ == "__main__":
 
     parser.add_argument("--data_path", type=str, default="data/objaverse_data")
     parser.add_argument("--torch_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
-
+    parser.add_argument("--draft_model_name", type=str, default=None,
+                        help="Optional smaller PointLLM draft model for speculative decoding.")
+    parser.add_argument("--speculative_mode", type=str, default="linear", choices=["linear"],
+                        help="Speculative decoding mode. Currently only linear mode is enabled.")
+    parser.add_argument("--num_assistant_tokens", type=int, default=8,
+                        help="Draft tokens proposed per speculative decoding iteration (linear mode).")
+    parser.add_argument("--do_sample", action="store_true",
+                        help="Enable sampling. Default is greedy decoding for deterministic comparison.")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--top_p", type=float, default=1.0)
     args = parser.parse_args()
+    if not args.do_sample and (args.top_k > 0 or args.top_p < 1.0):
+        print("[INFO] Greedy mode is enabled; top_k/top_p are ignored.")
 
     dtype_mapping = {
         "float32": torch.float32,
@@ -152,6 +194,6 @@ if __name__ == "__main__":
 
     args.torch_dtype = dtype_mapping[args.torch_dtype]
 
-    model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv = init_model(args)
+    model, assistant_model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv = init_model(args)
     
-    start_conversation(args, model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv)
+    start_conversation(args, model, assistant_model, tokenizer, point_backbone_config, keywords, mm_use_point_start_end, conv)
