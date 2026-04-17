@@ -96,6 +96,7 @@ class ObjectPointCloudDataset(Dataset):
         self.pointnum = pointnum
         self.point_backbone_config = data_args.point_backbone_config if data_args is not None else None
         self.point_indicator = '<point>'
+        self.skip_missing_files = getattr(data_args, "skip_missing_files", True) if data_args is not None else True
 
         # Load the data list from JSON
         print(f"Loading anno file from {anno_path}.")
@@ -117,6 +118,16 @@ class ObjectPointCloudDataset(Dataset):
             if data.get('conversation_type', 'simple_description') in self.conversation_types 
             and data.get('object_id') not in filter_ids
         ]
+
+        if self.skip_missing_files:
+            before_missing_filter = len(self.list_data_dict)
+            self.list_data_dict = [
+                data for data in self.list_data_dict
+                if (self.point_indicator not in data['conversations'][0]['value']) or self._point_cloud_file_exists(data.get('object_id', ''))
+            ]
+            missing_removed = before_missing_filter - len(self.list_data_dict)
+            if missing_removed > 0:
+                print(f"[WARNING] Removed {missing_removed} samples with missing point cloud files.")
 
         # * print after filtering
         print(f"After filtering, the dataset size is: {len(self.list_data_dict)}.")
@@ -150,6 +161,12 @@ class ObjectPointCloudDataset(Dataset):
 
         return point_cloud
 
+    def _point_cloud_file_exists(self, object_id):
+        if object_id is None or object_id == "":
+            return False
+        filename = f"{object_id}_{self.pointnum}.npy"
+        return os.path.exists(os.path.join(self.data_path, filename))
+
     def pc_norm(self, pc):
         """ pc: NxC, return NxC """
         xyz = pc[:, :3]
@@ -171,6 +188,14 @@ class ObjectPointCloudDataset(Dataset):
         if self.point_indicator in sources[0]['conversations'][0]['value']:
 
             object_id = self.list_data_dict[index]['object_id']
+            if not self._point_cloud_file_exists(object_id):
+                if self.skip_missing_files:
+                    new_index = (index + 1) % len(self.list_data_dict)
+                    return self.__getitem__(new_index)
+                raise FileNotFoundError(
+                    f"Missing point cloud file for object_id={object_id}, expected at "
+                    f"{os.path.join(self.data_path, f'{object_id}_{self.pointnum}.npy')}"
+                )
 
             # Point cloud representation
             point_cloud = self._load_point_cloud(object_id) # * N, C
@@ -247,4 +272,3 @@ if __name__ == '__main__':
 
     # Example usage
     print(f'Dataset length: {len(dataset)}')
-

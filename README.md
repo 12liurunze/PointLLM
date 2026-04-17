@@ -180,6 +180,30 @@ scripts/PointLLM_train_stage1.sh
 scripts/PointLLM_train_stage2.sh
 ```
 
+#### Train a Draft Model for EAGLE-Style Speculative Decoding
+If you want to use speculative decoding with a small draft model (student) and a larger PointLLM target model (teacher), you can distill a draft model with:
+```bash
+cd PointLLM
+bash scripts/PointLLM_train_draft.sh
+```
+The script supports:
+- `TARGET_MODEL`: target (teacher) checkpoint
+- `STUDENT_MODEL`: optional existing student checkpoint (if empty, a smaller student with fewer layers is initialized from teacher config)
+- `OUTPUT_DIR`: output path of distilled draft model
+- `DATA_PATH` / `ANNO_PATH`: distillation training data
+
+Example:
+```bash
+TARGET_MODEL=RunsenXu/PointLLM_7B_v1.2 \
+STUDENT_MODEL= \
+OUTPUT_DIR=./checkpoints/PointLLM_draft_12l \
+DATA_PATH=./data/objaverse_data \
+ANNO_PATH=./data/anno_data/PointLLM_complex_instruction_70K.json \
+bash scripts/PointLLM_train_draft.sh
+```
+If you see `HFValidationError ... Repo id ... ''`, it usually means the target model argument is empty. Make sure `TARGET_MODEL` is set to a valid local checkpoint path or HuggingFace repo id before launching.
+If you see `FileNotFoundError ... data/objaverse_data/..._8192.npy`, it means some object ids referenced by the annotation file are missing in your local point-cloud folder. The training dataset now skips missing files by default (`--skip_missing_files True`).
+
 #### PointLLM-v1.1 and PointLLM-v1.2
 Usually, you do not have to care about the following contents. They are only for reproducing the results in our v1 paper (PointLLM-v1.1). If you want to compare with our models or use our models for downstream tasks, please use PointLLM-v1.2 (refer to our v2 paper), which has better performance.
 <details>
@@ -209,10 +233,32 @@ Usually, you do not have to care about the following contents. They are only for
 2. Run the following command to launch a chatbot using the `torch.float32` data type for chatting about 3D models of Objaverse. The model checkpoints will be downloaded automatically. You can also manually download the model checkpoints and specify their paths. Here is an example:
 ```bash
 cd PointLLM
-PYTHONPATH=$PWD python pointllm/eval/PointLLM_chat.py --model_name RunsenXu/PointLLM_7B_v1.2 --data_name data/objaverse_data --torch_dtype float32
+PYTHONPATH=$PWD python pointllm/eval/PointLLM_chat.py --model_name RunsenXu/PointLLM_7B_v1.2 --data_path data/objaverse_data --torch_dtype float32
 ```
-3. You can also easily modify the codes for using point clouds other than those from Objaverse, as long as the point clouds input to the model have dimensions (N, 6), where the first three dimensions are `xyz` and the last three dimensions are `rgb` (in [0, 1] range). You may sample the point clouds to have 8192 points, as our model is trained on such point clouds.
-4. The following table shows GPU requirements for different models and data types. We recommend using `torch.bfloat16` if applicable, which is used in the experiments in our paper.
+3. To enable EAGLE-style speculative decoding (draft + target verification), provide a smaller draft checkpoint. Example:
+```bash
+PYTHONPATH=$PWD python pointllm/eval/PointLLM_chat.py \
+  --model_name RunsenXu/PointLLM_7B_v1.2 \
+  --draft_model_name /path/to/PointLLM_draft \
+  --speculative_mode linear \
+  --num_assistant_tokens 8 \
+  --data_path data/objaverse_data \
+  --torch_dtype bfloat16
+```
+You can also use tree-based speculation:
+```bash
+PYTHONPATH=$PWD python pointllm/eval/PointLLM_chat.py \
+  --model_name RunsenXu/PointLLM_7B_v1.2 \
+  --draft_model_name /path/to/PointLLM_draft \
+  --speculative_mode tree \
+  --tree_depth 4 \
+  --tree_branching_factor 2 \
+  --tree_max_paths 16 \
+  --data_path data/objaverse_data \
+  --torch_dtype bfloat16
+```
+4. You can also easily modify the codes for using point clouds other than those from Objaverse, as long as the point clouds input to the model have dimensions (N, 6), where the first three dimensions are `xyz` and the last three dimensions are `rgb` (in [0, 1] range). You may sample the point clouds to have 8192 points, as our model is trained on such point clouds.
+5. The following table shows GPU requirements for different models and data types. We recommend using `torch.bfloat16` if applicable, which is used in the experiments in our paper.
    
     |  Model   | Data Type | GPU Memory |
     |:--------:|:---------:|:----------:|
@@ -261,6 +307,27 @@ python pointllm/eval/eval_modelnet_cls.py --model_name RunsenXu/PointLLM_7B_v1.2
   ]
 }
 ```
+
+#### Benchmark Speculative vs Non-Speculative Decoding
+To measure latency difference, speedup ratio, and acceptance-rate-related metrics:
+```bash
+cd PointLLM
+PYTHONPATH=$PWD python pointllm/eval/benchmark_speculative.py \
+  --model_name RunsenXu/PointLLM_7B_v1.2 \
+  --draft_model_name /path/to/PointLLM_draft \
+  --speculative_mode tree \
+  --object_ids 000074a334c541878360457c672b6c2e 0001623d4f6f4f6ab0f08f6a760e6bcf \
+  --data_path data/objaverse_data \
+  --max_length 512 \
+  --torch_dtype bfloat16 \
+  --save_json /tmp/spec_benchmark.json
+```
+The script reports:
+- `vanilla_total_time_sec` / `spec_total_time_sec`
+- `speedup_x`
+- `vanilla_tokens_per_sec` / `spec_tokens_per_sec`
+- `draft_acceptance_rate`
+- `draft_proposed_tokens`, `accepted_draft_tokens`, `target_corrections`
 
 #### ChatGPT/GPT-4 Evaluation
 1. Get your OpenAI API key at [https://platform.openai.com/api-keys](https://platform.openai.com/api-keys).
