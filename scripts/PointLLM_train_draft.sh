@@ -10,6 +10,14 @@ OUTPUT_DIR=${OUTPUT_DIR:-./checkpoints/PointLLM_draft}
 DATA_PATH=${DATA_PATH:-./data/objaverse_data}
 ANNO_PATH=${ANNO_PATH:-./data/anno_data/PointLLM_complex_instruction_70K.json}
 
+if [ -z "$TARGET_MODEL" ]; then
+  echo "[ERROR] TARGET_MODEL is empty. Please set TARGET_MODEL to a valid model path or repo id."
+  exit 1
+fi
+
+echo "[INFO] TARGET_MODEL=$TARGET_MODEL"
+echo "[INFO] OUTPUT_DIR=$OUTPUT_DIR"
+
 EXTRA_ARGS=()
 if [ -n "$STUDENT_MODEL" ]; then
   EXTRA_ARGS+=(--student_model_name_or_path "$STUDENT_MODEL")

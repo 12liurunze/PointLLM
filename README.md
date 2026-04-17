@@ -201,6 +201,7 @@ DATA_PATH=./data/objaverse_data \
 ANNO_PATH=./data/anno_data/PointLLM_complex_instruction_70K.json \
 bash scripts/PointLLM_train_draft.sh
 ```
+If you see `HFValidationError ... Repo id ... ''`, it usually means the target model argument is empty. Make sure `TARGET_MODEL` is set to a valid local checkpoint path or HuggingFace repo id before launching.
 
 #### PointLLM-v1.1 and PointLLM-v1.2
 Usually, you do not have to care about the following contents. They are only for reproducing the results in our v1 paper (PointLLM-v1.1). If you want to compare with our models or use our models for downstream tasks, please use PointLLM-v1.2 (refer to our v2 paper), which has better performance.

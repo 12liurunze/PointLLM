@@ -19,6 +19,8 @@ IGNORE_INDEX = -100
 @dataclass
 class ModelArguments:
     target_model_name_or_path: str = field(default="")
+    # backward-compatible alias for older launch commands
+    target_model_path: Optional[str] = field(default=None)
     student_model_name_or_path: Optional[str] = field(default=None)
     student_num_hidden_layers: int = field(default=12)
 
@@ -87,8 +89,21 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = torch.bfloat16 if distill_args.bf16 else (torch.float16 if distill_args.fp16 else torch.float32)
 
+    target_model_path = model_args.target_model_name_or_path
+    if (target_model_path is None or target_model_path.strip() == "") and model_args.target_model_path is not None:
+        target_model_path = model_args.target_model_path
+    if target_model_path is None or target_model_path.strip() == "":
+        raise ValueError(
+            "target model path is empty. Please pass --target_model_name_or_path "
+            "(or legacy --target_model_path) with a valid local path or HF repo id."
+        )
+
+    student_model_path = model_args.student_model_name_or_path
+    if student_model_path is not None and student_model_path.strip() == "":
+        student_model_path = None
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.target_model_name_or_path,
+        target_model_path,
         cache_dir=distill_args.cache_dir,
         model_max_length=distill_args.model_max_length,
         padding_side="right",
@@ -98,7 +113,7 @@ def main():
     conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1_1"]
 
     teacher_model = PointLLMLlamaForCausalLM.from_pretrained(
-        model_args.target_model_name_or_path,
+        target_model_path,
         cache_dir=distill_args.cache_dir,
         torch_dtype=torch_dtype,
     ).to(device)
@@ -106,9 +121,9 @@ def main():
     teacher_model.eval()
     teacher_model.requires_grad_(False)
 
-    if model_args.student_model_name_or_path is not None:
+    if student_model_path is not None:
         student_model = PointLLMLlamaForCausalLM.from_pretrained(
-            model_args.student_model_name_or_path,
+            student_model_path,
             cache_dir=distill_args.cache_dir,
             torch_dtype=torch_dtype,
         ).to(device)
