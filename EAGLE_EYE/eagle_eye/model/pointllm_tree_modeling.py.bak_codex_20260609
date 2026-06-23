@@ -1,0 +1,459 @@
+import math
+import os
+from contextlib import nullcontext
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+from torch.nn import CrossEntropyLoss
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+
+from .modeling_llama_kv import LlamaForCausalLM as TreeLlamaForCausalLM
+from .modeling_llama_kv import LlamaModel as TreeLlamaModel
+
+
+class PointLLMTreeConfig(LlamaConfig):
+    model_type = "pointllm"
+
+
+def _env_flag(name):
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _spatial_keep_count(num_points, point_backbone_config):
+    if _env_flag("DISABLE_POINT_SPATIAL_COMPRESSION"):
+        return num_points
+    target_points = int(os.environ.get("POINT_SPATIAL_NUM_POINTS", "0") or 0)
+    keep_ratio = float(os.environ.get("POINT_SPATIAL_KEEP_RATIO", "1.0") or 1.0)
+    if target_points <= 0 and keep_ratio >= 1.0:
+        return num_points
+
+    keep_count = num_points
+    if keep_ratio < 1.0:
+        keep_count = min(keep_count, int(math.ceil(num_points * max(keep_ratio, 1e-6))))
+    if target_points > 0:
+        keep_count = min(keep_count, target_points)
+
+    min_points = int(os.environ.get("POINT_SPATIAL_MIN_POINTS", "0") or 0)
+    if min_points <= 0 and point_backbone_config is not None:
+        min_points = max(1, int(point_backbone_config.get("point_token_len", 1)) - 1)
+    keep_count = max(min_points, keep_count)
+    return max(1, min(num_points, keep_count))
+
+
+def _fps_indices(points_xyz, keep_count):
+    num_points = points_xyz.shape[0]
+    if keep_count >= num_points:
+        return torch.arange(num_points, device=points_xyz.device)
+
+    points = points_xyz.float()
+    selected = torch.empty(keep_count, dtype=torch.long, device=points.device)
+    centroid = points.mean(dim=0, keepdim=True)
+    farthest = torch.sum((points - centroid) ** 2, dim=-1).argmax()
+    min_dist = torch.full((num_points,), float("inf"), device=points.device)
+    for i in range(keep_count):
+        selected[i] = farthest
+        cur = points[farthest].unsqueeze(0)
+        dist = torch.sum((points - cur) ** 2, dim=-1)
+        min_dist = torch.minimum(min_dist, dist)
+        farthest = min_dist.argmax()
+    return selected.sort().values
+
+
+def _fps_sample_one(point_cloud, keep_count):
+    if keep_count >= point_cloud.shape[0]:
+        return point_cloud
+    indices = _fps_indices(point_cloud[:, :3], keep_count)
+    return point_cloud.index_select(0, indices)
+
+
+class PointLLMTreeLlamaModel(TreeLlamaModel):
+    config_class = PointLLMTreeConfig
+
+    def __init__(self, config: LlamaConfig):
+        if not hasattr(config, "_attn_implementation"):
+            config._attn_implementation = "eager"
+        if not hasattr(config, "attention_dropout"):
+            config.attention_dropout = 0.0
+        if not hasattr(config, "attention_bias"):
+            config.attention_bias = False
+        if not hasattr(config, "rope_theta"):
+            config.rope_theta = 10000.0
+        if not hasattr(config, "rope_scaling"):
+            config.rope_scaling = None
+        if not hasattr(config, "pretraining_tp"):
+            config.pretraining_tp = 1
+        if not hasattr(config, "num_key_value_heads"):
+            config.num_key_value_heads = config.num_attention_heads
+        super().__init__(config)
+
+        self.point_backbone_type = config.point_backbone
+        if self.point_backbone_type != "PointBERT":
+            raise ValueError(f"Unsupported PointLLM point backbone: {self.point_backbone_type}")
+
+        try:
+            import pointllm.model as pointllm_model
+            from pointllm.model import PointTransformer
+            try:
+                from pointllm.model.utils import cfg_from_yaml_file
+            except ImportError:
+                from pointllm.utils import cfg_from_yaml_file
+        except ImportError as exc:
+            raise ImportError(
+                "PointLLMTreeLlamaModel requires the PointLLM package. "
+                "Install PointLLM with `pip install -e /path/to/PointLLM` or add it to PYTHONPATH."
+            ) from exc
+
+        point_bert_config_name = getattr(
+            config, "point_backbone_config_name", "PointTransformer_8192point_2layer"
+        )
+        pointllm_model_dir = os.path.dirname(pointllm_model.__file__)
+        point_bert_config_addr = os.path.join(
+            pointllm_model_dir, "pointbert", f"{point_bert_config_name}.yaml"
+        )
+        point_bert_config = cfg_from_yaml_file(point_bert_config_addr)
+        if getattr(config, "force_single_point_proj", False):
+            point_bert_config.model.projection_hidden_layer = 0
+            if "projection_hidden_dim" in point_bert_config.model:
+                del point_bert_config.model.projection_hidden_dim
+        if getattr(config, "use_color", False):
+            point_bert_config.model.point_dims = 6
+        use_max_pool = getattr(point_bert_config.model, "use_max_pool", False)
+
+        self.point_backbone = PointTransformer(point_bert_config.model, use_max_pool=use_max_pool)
+        self.point_backbone_config = {
+            "point_cloud_dim": point_bert_config.model.point_dims,
+            "backbone_output_dim": point_bert_config.model.trans_dim
+            if not use_max_pool
+            else point_bert_config.model.trans_dim * 2,
+            "project_output_dim": self.config.hidden_size,
+            "point_token_len": point_bert_config.model.num_group + 1 if not use_max_pool else 1,
+            "mm_use_point_start_end": self.config.mm_use_point_start_end,
+            "projection_hidden_layer": point_bert_config.model.get("projection_hidden_layer", 0),
+            "use_max_pool": use_max_pool,
+        }
+        if point_bert_config.model.get("projection_hidden_layer", 0) > 0:
+            self.point_backbone_config["projection_hidden_dim"] = (
+                point_bert_config.model.projection_hidden_dim
+            )
+
+        backbone_output_dim = self.point_backbone_config["backbone_output_dim"]
+        if self.point_backbone_config["projection_hidden_layer"] > 0:
+            projection_layers = []
+            last_dim = backbone_output_dim
+            for i in range(point_bert_config.model.projection_hidden_layer):
+                projection_layers.append(
+                    nn.Linear(last_dim, self.point_backbone_config["projection_hidden_dim"][i])
+                )
+                projection_layers.append(nn.GELU())
+                last_dim = self.point_backbone_config["projection_hidden_dim"][i]
+            projection_layers.append(nn.Linear(last_dim, self.config.hidden_size))
+            self.point_proj = nn.Sequential(*projection_layers)
+        else:
+            self.point_proj = nn.Linear(backbone_output_dim, self.config.hidden_size)
+
+        self.fix_pointnet = False
+        self.fix_llm = False
+
+    def load_point_backbone_checkpoint(self, checkpoint_path=None):
+        self.point_backbone.load_checkpoint(
+            self.config.point_backbone_ckpt if checkpoint_path is None else checkpoint_path
+        )
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        point_clouds: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        orig_embeds_params = getattr(self, "orig_embeds_params", None)
+
+        point_backbone_config = getattr(self, "point_backbone_config", None)
+        is_prefill_or_training = input_ids is not None and (input_ids.shape[1] != 1 or self.training)
+        if point_clouds is not None and point_backbone_config is not None and is_prefill_or_training:
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            spatial_stats = []
+            if isinstance(point_clouds, list):
+                compressed_point_clouds = []
+                for point_cloud in point_clouds:
+                    original_points = int(point_cloud.shape[0])
+                    keep_count = _spatial_keep_count(original_points, point_backbone_config)
+                    compressed_point_clouds.append(_fps_sample_one(point_cloud, keep_count))
+                    spatial_stats.append({"original_points": original_points, "compressed_points": int(keep_count)})
+            else:
+                original_points = int(point_clouds.shape[1])
+                keep_count = _spatial_keep_count(original_points, point_backbone_config)
+                compressed_point_clouds = point_clouds
+                if keep_count < original_points:
+                    compressed_point_clouds = torch.stack(
+                        [_fps_sample_one(point_cloud, keep_count) for point_cloud in point_clouds], dim=0
+                    )
+                spatial_stats = [
+                    {"original_points": original_points, "compressed_points": int(keep_count)}
+                    for _ in range(int(point_clouds.shape[0]))
+                ]
+            self.last_point_spatial_compression = spatial_stats
+
+            with torch.no_grad() if self.fix_pointnet else nullcontext():
+                if self.fix_pointnet:
+                    self.point_backbone.eval()
+                if isinstance(compressed_point_clouds, list):
+                    point_features = [
+                        self.point_backbone(point_cloud.unsqueeze(0))[0]
+                        for point_cloud in compressed_point_clouds
+                    ]
+                else:
+                    point_features = self.point_backbone(compressed_point_clouds)
+
+            if isinstance(point_clouds, list):
+                point_features = [self.point_proj(point_feature) for point_feature in point_features]
+            else:
+                point_features = self.point_proj(point_features)
+
+            dummy_point_features = torch.zeros(
+                point_backbone_config["point_token_len"],
+                point_backbone_config["backbone_output_dim"],
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+            dummy_point_features = self.point_proj(dummy_point_features)
+
+            new_input_embeds = []
+            cur_point_idx = 0
+            for cur_input_ids, cur_input_embeds in zip(input_ids, inputs_embeds):
+                if (cur_input_ids == point_backbone_config["point_patch_token"]).sum() == 0:
+                    cur_input_embeds = cur_input_embeds + (0.0 * dummy_point_features).sum()
+                    new_input_embeds.append(cur_input_embeds)
+                    cur_point_idx += 1
+                    continue
+
+                cur_point_features = point_features[cur_point_idx].to(
+                    device=cur_input_embeds.device, dtype=cur_input_embeds.dtype
+                )
+                num_patches = cur_point_features.shape[0]
+
+                if point_backbone_config["mm_use_point_start_end"]:
+                    if (cur_input_ids == point_backbone_config["point_start_token"]).sum() != (
+                        cur_input_ids == point_backbone_config["point_end_token"]
+                    ).sum():
+                        raise ValueError("Point start/end token counts do not match.")
+                    point_start_tokens = torch.where(
+                        cur_input_ids == point_backbone_config["point_start_token"]
+                    )[0]
+                    cur_new_input_embeds = cur_input_embeds
+                    for point_start_token_pos in point_start_tokens:
+                        if (
+                            cur_input_ids[point_start_token_pos + num_patches + 1]
+                            != point_backbone_config["point_end_token"]
+                        ):
+                            raise ValueError("The point end token should follow point patch tokens.")
+                        if orig_embeds_params is not None:
+                            cur_new_input_embeds = torch.cat(
+                                (
+                                    cur_input_embeds[:point_start_token_pos].detach(),
+                                    cur_input_embeds[point_start_token_pos : point_start_token_pos + 1],
+                                    cur_point_features,
+                                    cur_input_embeds[
+                                        point_start_token_pos
+                                        + num_patches
+                                        + 1 : point_start_token_pos
+                                        + num_patches
+                                        + 2
+                                    ],
+                                    cur_input_embeds[
+                                        point_start_token_pos + num_patches + 2 :
+                                    ].detach(),
+                                ),
+                                dim=0,
+                            )
+                        else:
+                            cur_new_input_embeds = torch.cat(
+                                (
+                                    cur_input_embeds[: point_start_token_pos + 1],
+                                    cur_point_features,
+                                    cur_input_embeds[point_start_token_pos + num_patches + 1 :],
+                                ),
+                                dim=0,
+                            )
+                        cur_point_idx += 1
+                    new_input_embeds.append(cur_new_input_embeds)
+                else:
+                    if (cur_input_ids == point_backbone_config["point_patch_token"]).sum() != num_patches:
+                        raise ValueError("The number of point patch tokens must match point features.")
+                    masked_indices = torch.where(
+                        cur_input_ids == point_backbone_config["point_patch_token"]
+                    )[0]
+                    mask_index_start = masked_indices[0]
+                    expected = torch.arange(
+                        mask_index_start,
+                        mask_index_start + num_patches,
+                        device=masked_indices.device,
+                        dtype=masked_indices.dtype,
+                    )
+                    if (masked_indices != expected).any():
+                        raise ValueError("Point patch tokens should be consecutive.")
+                    if orig_embeds_params is not None:
+                        cur_new_input_embeds = torch.cat(
+                            (
+                                cur_input_embeds[:mask_index_start].detach(),
+                                cur_point_features,
+                                cur_input_embeds[mask_index_start + num_patches :].detach(),
+                            ),
+                            dim=0,
+                        )
+                    else:
+                        cur_new_input_embeds = torch.cat(
+                            (
+                                cur_input_embeds[:mask_index_start],
+                                cur_point_features,
+                                cur_input_embeds[mask_index_start + num_patches :],
+                            ),
+                            dim=0,
+                        )
+                    new_input_embeds.append(cur_new_input_embeds)
+                    cur_point_idx += 1
+
+            inputs_embeds = torch.stack(new_input_embeds, dim=0)
+            input_ids = None
+        elif inputs_embeds is not None:
+            input_ids = None
+
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+
+class PointLLMTreeForCausalLM(TreeLlamaForCausalLM):
+    config_class = PointLLMTreeConfig
+
+    def __init__(self, config):
+        super(TreeLlamaForCausalLM, self).__init__(config)
+        self.model = PointLLMTreeLlamaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_model(self):
+        return self.model
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        point_clouds: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            point_clouds=point_clouds,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1).to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+        model_inputs["point_clouds"] = kwargs.get("point_clouds", None)
+        return model_inputs
+
+    def initialize_tokenizer_point_backbone_config_wo_embedding(self, tokenizer):
+        config = self.config
+        point_backbone_config = self.get_model().point_backbone_config
+        mm_use_point_start_end = point_backbone_config["mm_use_point_start_end"] = (
+            config.mm_use_point_start_end
+        )
+
+        default_point_patch_token = config.DEFAULT_POINT_PATCH_TOKEN
+        tokenizer.add_tokens([default_point_patch_token], special_tokens=True)
+        point_backbone_config["default_point_patch_token"] = default_point_patch_token
+        point_backbone_config["point_patch_token"] = tokenizer.convert_tokens_to_ids(
+            [default_point_patch_token]
+        )[0]
+
+        if mm_use_point_start_end:
+            default_point_start_token = config.DEFAULT_POINT_START_TOKEN
+            default_point_end_token = config.DEFAULT_POINT_END_TOKEN
+            tokenizer.add_tokens(
+                [default_point_start_token, default_point_end_token], special_tokens=True
+            )
+            point_backbone_config["default_point_start_token"] = default_point_start_token
+            point_backbone_config["default_point_end_token"] = default_point_end_token
+            point_backbone_config["point_start_token"] = tokenizer.convert_tokens_to_ids(
+                [default_point_start_token]
+            )[0]
+            point_backbone_config["point_end_token"] = tokenizer.convert_tokens_to_ids(
+                [default_point_end_token]
+            )[0]
+
+
+AutoConfig.register("pointllm", PointLLMTreeConfig)
+AutoModelForCausalLM.register(PointLLMTreeConfig, PointLLMTreeForCausalLM)

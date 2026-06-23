@@ -1,12 +1,22 @@
-__pycache__
-*.egg-info
-.vscode
-checkpoints
-outputs
-wandb
-anno_data
-objaverse_data
-modelnet40_data
-*.zip
-*.ipynb
-serving_workdirs
+# heavy runtime artifacts
+results/
+EAGLE_EYE/results/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.jsonl
+*.log
+
+# python/cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local env/runtime
+.env
+wandb/
+runs/

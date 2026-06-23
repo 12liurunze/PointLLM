@@ -1,0 +1,710 @@
+import argparse
+import copy
+import os
+import math
+import sys
+
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from transformers import AutoConfig
+
+
+def add_pointllm_to_path(pointllm_repo_path):
+    if pointllm_repo_path and pointllm_repo_path not in sys.path:
+        sys.path.insert(0, pointllm_repo_path)
+
+
+def load_checkpoint_tensors_by_prefix(model, checkpoint_dir, prefixes):
+    wanted = set(model.state_dict().keys())
+    patch = {}
+
+    single_bin = os.path.join(checkpoint_dir, "pytorch_model.bin")
+    bin_files = []
+    if os.path.exists(single_bin):
+        bin_files.append(single_bin)
+    else:
+        bin_files.extend(
+            os.path.join(checkpoint_dir, name)
+            for name in sorted(os.listdir(checkpoint_dir))
+            if name.endswith(".bin")
+        )
+
+    for bin_file in bin_files:
+        weights = torch.load(bin_file, map_location="cpu")
+        for key, value in weights.items():
+            if key in wanted and any(key.startswith(prefix) for prefix in prefixes):
+                patch[key] = value
+
+    if patch:
+        model.load_state_dict(patch, strict=False)
+        print(f"[INFO] Manually loaded {len(patch)} tensors from checkpoint shards: {sorted(patch)}")
+
+
+def build_dataset(args, tokenizer, point_backbone_config):
+    from pointllm.data.object_point_dataset import ObjectPointCloudDataset
+    from pointllm import conversation as conversation_lib
+
+    conversation_lib.default_conversation = conversation_lib.conv_templates[args.conv_mode].copy()
+
+    class DataArgs:
+        pass
+
+    data_args = DataArgs()
+    data_args.point_backbone_config = point_backbone_config
+    data_args.data_debug_num = 0
+    data_args.split_train_val = False
+    data_args.split_ratio = 1.0
+
+    dataset = ObjectPointCloudDataset(
+        data_path=args.data_path,
+        anno_path=args.anno_path,
+        tokenizer=tokenizer,
+        pointnum=args.pointnum,
+        split="train",
+        conversation_types=tuple(args.conversation_types.split(",")),
+        use_color=True,
+        data_args=data_args,
+    )
+    end = min(args.end, len(dataset)) if args.end > 0 else len(dataset)
+    return dataset, range(args.start, end)
+
+
+def make_loss_mask(labels):
+    return (labels != -100).long()
+
+
+def _build_text_query(sequence, point_mask, loss_mask=None, query_mode="all"):
+    text_mask = ~point_mask
+    if loss_mask is not None and query_mode in {"prompt", "question"}:
+        text_mask = text_mask & (loss_mask.to(device=point_mask.device).bool() == 0)
+    if query_mode == "question" and point_mask.any():
+        point_indices = point_mask.nonzero(as_tuple=False).flatten()
+        text_mask[: int(point_indices[-1].item()) + 1] = False
+    text_tokens = sequence[text_mask]
+    if text_tokens.numel() == 0:
+        text_tokens = sequence[~point_mask]
+    if text_tokens.numel() == 0:
+        return sequence.mean(dim=0)
+    return text_tokens.mean(dim=0)
+
+
+def _chunk_mean(values, chunks):
+    if values.shape[0] == 0 or chunks <= 0:
+        return values[:0]
+    chunks = min(chunks, values.shape[0])
+    boundaries = torch.linspace(0, values.shape[0], steps=chunks + 1, device=values.device)
+    outputs = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        s = int(start.item())
+        e = int(end.item())
+        if e <= s:
+            e = min(s + 1, values.shape[0])
+        outputs.append(values[s:e].mean(dim=0, keepdim=True))
+    return torch.cat(outputs, dim=0)
+
+
+def _score_point_tokens(point_tokens, query, text_weight, geometry_weight=1.0):
+    # Geometry score keeps salient point tokens; query score keeps text-relevant ones.
+    point_norm = torch.nn.functional.normalize(point_tokens.float(), dim=-1)
+    query_norm = torch.nn.functional.normalize(query.float(), dim=0)
+    centroid = point_norm.mean(dim=0, keepdim=True)
+    score_geom = (point_norm - centroid).pow(2).mean(dim=-1)
+    score_text = torch.matmul(point_norm, query_norm)
+    return geometry_weight * score_geom + text_weight * score_text
+
+
+def _parse_point_token_components(components):
+    if components is None:
+        return {"geometry", "semantic", "summary"}
+    if isinstance(components, str):
+        values = {part.strip().lower() for part in components.split(",") if part.strip()}
+    else:
+        values = {str(part).strip().lower() for part in components if str(part).strip()}
+    aliases = {
+        "g": "geometry",
+        "geo": "geometry",
+        "s": "semantic",
+        "sem": "semantic",
+        "u": "summary",
+        "sum": "summary",
+    }
+    values = {aliases.get(value, value) for value in values}
+    allowed = {"geometry", "semantic", "summary"}
+    unknown = values - allowed
+    if unknown:
+        raise ValueError(f"Unknown point token components: {sorted(unknown)}")
+    return values or set()
+
+
+
+def _morton_codes(centers, depth):
+    depth = max(1, min(int(depth), 10))
+    xyz = centers.float()
+    xyz_min = xyz.amin(dim=0, keepdim=True)
+    xyz_span = (xyz.amax(dim=0, keepdim=True) - xyz_min).clamp_min(1e-6)
+    scale = (1 << depth) - 1
+    quantized = (((xyz - xyz_min) / xyz_span) * scale).floor().long()
+    codes = torch.zeros(xyz.shape[0], dtype=torch.long, device=xyz.device)
+    for bit in range(depth):
+        codes |= ((quantized[:, 0] >> bit) & 1) << (3 * bit)
+        codes |= ((quantized[:, 1] >> bit) & 1) << (3 * bit + 1)
+        codes |= ((quantized[:, 2] >> bit) & 1) << (3 * bit + 2)
+    return codes
+
+
+def _spatially_diverse_topk(scores, centers, count, depth):
+    count = min(max(0, count), scores.shape[0])
+    if count == 0:
+        return torch.empty(0, dtype=torch.long, device=scores.device)
+    order = torch.argsort(_morton_codes(centers, depth))
+    boundaries = torch.linspace(0, order.shape[0], steps=count + 1, device=order.device)
+    selected = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        start_idx = int(start.item())
+        end_idx = max(start_idx + 1, int(end.item()))
+        candidates = order[start_idx:end_idx]
+        selected.append(candidates[scores[candidates].argmax()])
+    return torch.stack(selected)
+
+
+def _hierarchical_octree_groups(centers, scores, chunks, levels, density_weight):
+    allocations = [1] * len(levels)
+    for index in range(chunks - len(levels)):
+        allocations[-1 - (index % len(levels))] += 1
+    groups = []
+    for depth, allocation in zip(levels, allocations):
+        codes = _morton_codes(centers, depth)
+        ranked_cells = []
+        for code in torch.unique(codes):
+            members = torch.where(codes == code)[0]
+            cell_score = scores[members].max()
+            cell_score = cell_score + density_weight * torch.log1p(
+                torch.tensor(float(members.numel()), device=scores.device)
+            )
+            ranked_cells.append((cell_score, members))
+        ranked_cells.sort(key=lambda item: float(item[0]), reverse=True)
+        groups.extend(members for _, members in ranked_cells[:allocation])
+    return groups[:chunks]
+
+
+def _pool_semantic_groups(values, scores, groups, temperature):
+    outputs = []
+    for members in groups:
+        if scores is None:
+            pooled = values[members].float().mean(dim=0, keepdim=True)
+        else:
+            weights = torch.softmax(scores[members].float() / max(temperature, 1e-4), dim=0)
+            pooled = torch.sum(values[members].float() * weights[:, None], dim=0, keepdim=True)
+        outputs.append(pooled.to(values.dtype))
+    return torch.cat(outputs, dim=0) if outputs else values[:0]
+
+
+def _sequence_summary(values, scores, chunks, temperature, use_semantic):
+    if values.shape[0] == 0 or chunks <= 0:
+        return values[:0]
+    chunks = min(chunks, values.shape[0])
+    order = torch.arange(values.shape[0], device=values.device)
+    groups = [group for group in torch.tensor_split(order, chunks) if group.numel() > 0]
+    return _pool_semantic_groups(values, scores if use_semantic else None, groups, temperature)
+
+
+def _semantic_octree_coverage_stats(scores, centers, selected_local, point_count, summary_count, depth, temperature):
+    selected_count = int(selected_local.numel())
+    compressed_count = selected_count + int(summary_count)
+    fallback = min(1.0, float(compressed_count) / max(float(point_count), 1.0))
+    stats = {
+        "coverage_score": fallback,
+        "coverage_cell_ratio": fallback,
+        "coverage_semantic_mass": fallback,
+        "coverage_summary_ratio": min(1.0, float(summary_count) / max(float(point_count), 1.0)),
+    }
+    if centers is None or centers.shape[0] != point_count - 1 or point_count <= 1:
+        return stats
+    group_selected = selected_local[selected_local > 0] - 1
+    if group_selected.numel() == 0:
+        return stats
+    codes = _morton_codes(centers, depth)
+    total_cells = max(1, int(torch.unique(codes).numel()))
+    selected_cells = int(torch.unique(codes[group_selected]).numel())
+    cell_ratio = min(1.0, selected_cells / total_cells)
+    group_scores = scores[1:].float()
+    weights = torch.softmax(group_scores / max(float(temperature), 1e-4), dim=0)
+    semantic_mass = float(weights[group_selected].sum().clamp(0.0, 1.0).item())
+    summary_ratio = min(1.0, float(summary_count) / total_cells)
+    coverage_score = 0.55 * cell_ratio + 0.35 * semantic_mass + 0.10 * summary_ratio
+    stats.update(
+        {
+            "coverage_score": float(max(0.0, min(1.0, coverage_score))),
+            "coverage_cell_ratio": float(cell_ratio),
+            "coverage_semantic_mass": float(semantic_mass),
+            "coverage_summary_ratio": float(summary_ratio),
+            "coverage_total_cells": int(total_cells),
+            "coverage_selected_cells": int(selected_cells),
+        }
+    )
+    return stats
+
+
+def _semantic_octree_summary(values, centers, scores, chunks, depth, temperature):
+    if values.shape[0] == 0 or chunks <= 0:
+        return values[:0]
+    if centers is None or centers.shape[0] != values.shape[0]:
+        return _chunk_mean(values, chunks)
+
+    chunks = min(chunks, values.shape[0])
+    order = torch.argsort(_morton_codes(centers, depth))
+    groups = [group for group in torch.tensor_split(order, chunks) if group.numel() > 0]
+    return _pool_semantic_groups(values, scores, groups, temperature)
+
+
+def _spatial_keep_count(num_points, keep_ratio=1.0, target_points=0, min_points=1):
+    if target_points <= 0 and keep_ratio >= 1.0:
+        return num_points
+    keep_count = num_points
+    if keep_ratio < 1.0:
+        keep_count = min(keep_count, int(math.ceil(num_points * max(keep_ratio, 1e-6))))
+    if target_points > 0:
+        keep_count = min(keep_count, int(target_points))
+    keep_count = max(int(min_points), keep_count)
+    return max(1, min(num_points, keep_count))
+
+
+def _fps_indices(points_xyz, keep_count):
+    num_points = points_xyz.shape[0]
+    if keep_count >= num_points:
+        return torch.arange(num_points, device=points_xyz.device)
+
+    points = points_xyz.float()
+    selected = torch.empty(keep_count, dtype=torch.long, device=points.device)
+    centroid = points.mean(dim=0, keepdim=True)
+    farthest = torch.sum((points - centroid) ** 2, dim=-1).argmax()
+    min_dist = torch.full((num_points,), float("inf"), device=points.device)
+    for i in range(keep_count):
+        selected[i] = farthest
+        cur = points[farthest].unsqueeze(0)
+        dist = torch.sum((points - cur) ** 2, dim=-1)
+        min_dist = torch.minimum(min_dist, dist)
+        farthest = min_dist.argmax()
+    return selected.sort().values
+
+
+def fps_sample_point_cloud(point_cloud, keep_ratio=1.0, target_points=0, min_points=1):
+    original_points = int(point_cloud.shape[0])
+    keep_count = _spatial_keep_count(
+        original_points,
+        keep_ratio=keep_ratio,
+        target_points=target_points,
+        min_points=min_points,
+    )
+    if keep_count >= original_points:
+        return point_cloud, {"original_points": original_points, "compressed_points": original_points}
+    indices = _fps_indices(point_cloud[:, :3], keep_count)
+    return point_cloud.index_select(0, indices), {
+        "original_points": original_points,
+        "compressed_points": int(keep_count),
+        "method": "fps",
+    }
+
+
+def compress_point_tokens_in_item(
+    item,
+    point_patch_token,
+    keep_ratio=1.0,
+    summary_count=0,
+    text_weight=0.5,
+    group_centers=None,
+    spatial_mode="none",
+    octree_depth=4,
+    hierarchy_levels=(1, 2, 4),
+    density_weight=0.15,
+    semantic_temperature=0.25,
+    query_mode="all",
+    components="geometry,semantic,summary",
+):
+    component_set = _parse_point_token_components(components)
+    use_geometry = "geometry" in component_set
+    use_semantic = "semantic" in component_set
+    use_summary = "summary" in component_set
+    if keep_ratio >= 1.0 and (summary_count <= 0 or not use_summary):
+        return item
+
+    input_ids = item["input_ids"]
+    point_mask = input_ids == point_patch_token
+    point_count = int(point_mask.sum().item())
+    if point_count <= 1:
+        return item
+
+    point_indices = point_mask.nonzero(as_tuple=False).flatten()
+    keep_count = max(1, min(point_count, int(math.ceil(point_count * keep_ratio))))
+    summary_count = max(0, int(summary_count)) if use_summary else 0
+    if not (use_geometry or use_semantic) and use_summary:
+        keep_count = 1
+    if keep_count >= point_count and summary_count <= 0:
+        return item
+
+    inputs_embeds = item["inputs_embeds"]
+    hidden_state = item["hidden_state"]
+    loss_mask = item["loss_mask"]
+    query = _build_text_query(inputs_embeds, point_mask, loss_mask=loss_mask, query_mode=query_mode)
+    effective_text_weight = text_weight if use_semantic else 0.0
+    geometry_weight = 1.0 if use_geometry else 0.0
+    scores = _score_point_tokens(
+        inputs_embeds[point_indices],
+        query,
+        text_weight=effective_text_weight,
+        geometry_weight=geometry_weight,
+    )
+    centers = None
+    if group_centers is not None and point_count == group_centers.shape[0] + 1:
+        centers = group_centers.to(inputs_embeds.device)
+    if use_geometry and spatial_mode in {"octree", "semantic_octree", "hierarchical_octree"} and centers is not None:
+        if keep_count == 1:
+            selected_local = torch.zeros(1, dtype=torch.long, device=input_ids.device)
+        else:
+            group_selected = _spatially_diverse_topk(
+                scores[1:], centers, keep_count - 1, octree_depth
+            ) + 1
+            selected_local = torch.cat(
+                (torch.zeros(1, dtype=torch.long, device=input_ids.device), group_selected)
+            ).sort().values
+    elif use_geometry or use_semantic:
+        selected_local = torch.topk(scores, k=keep_count, largest=True).indices.sort().values
+    else:
+        selected_local = torch.arange(keep_count, dtype=torch.long, device=input_ids.device)
+    selected_point_indices = point_indices[selected_local]
+
+    coverage_stats = _semantic_octree_coverage_stats(
+        scores,
+        centers,
+        selected_local,
+        point_count,
+        summary_count,
+        octree_depth,
+        semantic_temperature,
+    )
+
+    selected_mask = torch.zeros(point_count, dtype=torch.bool, device=input_ids.device)
+    selected_mask[selected_local] = True
+    remaining_local = (~selected_mask).nonzero(as_tuple=False).flatten()
+
+    summary_input_embeds = inputs_embeds[:0]
+    summary_hidden_state = hidden_state[:0]
+    summary_input_ids = input_ids[:0]
+    summary_loss_mask = loss_mask[:0]
+    if summary_count > 0 and remaining_local.numel() > 0:
+        remaining_indices = point_indices[remaining_local]
+        remaining_embeds = inputs_embeds[remaining_indices]
+        remaining_hidden = hidden_state[remaining_indices]
+        if centers is not None:
+            group_local = remaining_local[remaining_local > 0] - 1
+            remaining_embeds = inputs_embeds[point_indices[remaining_local[remaining_local > 0]]]
+            remaining_hidden = hidden_state[point_indices[remaining_local[remaining_local > 0]]]
+            remaining_centers = centers[group_local]
+            remaining_scores = scores[remaining_local[remaining_local > 0]]
+        else:
+            remaining_centers = None
+            remaining_scores = None
+        if spatial_mode == "hierarchical_octree" and remaining_centers is not None:
+            groups = _hierarchical_octree_groups(
+                remaining_centers,
+                remaining_scores,
+                summary_count,
+                list(hierarchy_levels),
+                density_weight,
+            )
+            summary_input_embeds = _pool_semantic_groups(
+                remaining_embeds, remaining_scores, groups, semantic_temperature
+            )
+            summary_hidden_state = _pool_semantic_groups(
+                remaining_hidden, remaining_scores, groups, semantic_temperature
+            )
+        elif spatial_mode == "semantic_octree" and remaining_centers is not None and use_geometry and use_semantic:
+            summary_input_embeds = _semantic_octree_summary(
+                remaining_embeds,
+                remaining_centers,
+                remaining_scores,
+                summary_count,
+                octree_depth,
+                semantic_temperature,
+            )
+            summary_hidden_state = _semantic_octree_summary(
+                remaining_hidden,
+                remaining_centers,
+                remaining_scores,
+                summary_count,
+                octree_depth,
+                semantic_temperature,
+            )
+        elif use_semantic:
+            summary_input_embeds = _sequence_summary(
+                remaining_embeds, remaining_scores, summary_count, semantic_temperature, True
+            )
+            summary_hidden_state = _sequence_summary(
+                remaining_hidden, remaining_scores, summary_count, semantic_temperature, True
+            )
+        elif use_geometry and spatial_mode in {"octree", "semantic_octree"} and remaining_centers is not None:
+            order = torch.argsort(_morton_codes(remaining_centers, octree_depth))
+            summary_input_embeds = _chunk_mean(remaining_embeds[order], summary_count)
+            summary_hidden_state = _chunk_mean(remaining_hidden[order], summary_count)
+        else:
+            summary_input_embeds = _chunk_mean(remaining_embeds, summary_count)
+            summary_hidden_state = _chunk_mean(remaining_hidden, summary_count)
+        summary_input_ids = torch.full(
+            (summary_input_embeds.shape[0],), int(point_patch_token), dtype=input_ids.dtype, device=input_ids.device
+        )
+        summary_loss_mask = torch.zeros(summary_input_embeds.shape[0], dtype=loss_mask.dtype, device=loss_mask.device)
+
+    keep_sequence_mask = ~point_mask
+    keep_sequence_mask[selected_point_indices] = True
+    first_point_pos = int(point_indices[0].item())
+    prefix_mask = keep_sequence_mask[: first_point_pos + 1]
+    suffix_mask = keep_sequence_mask[first_point_pos + 1 :]
+
+    def assemble(sequence, summary):
+        return torch.cat(
+            (
+                sequence[: first_point_pos + 1][prefix_mask],
+                summary,
+                sequence[first_point_pos + 1 :][suffix_mask],
+            ),
+            dim=0,
+        )
+
+    item = dict(item)
+    item["input_ids"] = assemble(input_ids, summary_input_ids)
+    item["inputs_embeds"] = assemble(inputs_embeds, summary_input_embeds)
+    item["hidden_state"] = assemble(hidden_state, summary_hidden_state)
+    item["loss_mask"] = assemble(loss_mask, summary_loss_mask)
+    item["point_token_compression"] = {
+        "original_point_tokens": point_count,
+        "selected_point_tokens": int(keep_count),
+        "summary_tokens": int(summary_input_ids.shape[0]),
+        "compressed_point_tokens": int(keep_count + summary_input_ids.shape[0]),
+        "components": ",".join(sorted(component_set)),
+        **coverage_stats,
+    }
+    return item
+
+
+@torch.no_grad()
+def build_training_item(model, sample, device, dtype, compression_args=None, spatial_compression_args=None):
+    input_ids = sample["input_ids"].unsqueeze(0).to(device)
+    point_cloud = sample["point_clouds"].to(device=device, dtype=dtype)
+    spatial_stats = None
+    if spatial_compression_args is not None:
+        point_cloud, spatial_stats = fps_sample_point_cloud(point_cloud, **spatial_compression_args)
+    point_clouds = point_cloud.unsqueeze(0)
+    loss_mask = make_loss_mask(sample["labels"]).to(input_ids.device)
+
+    outputs = model(
+        input_ids=input_ids,
+        point_clouds=point_clouds,
+        output_hidden_states=True,
+    )
+    group_centers = getattr(model.get_model(), "last_point_group_centers", None)
+    if group_centers is not None:
+        group_centers = group_centers[0].detach().cpu()
+
+    item = {
+        "input_ids": input_ids.cpu()[0],
+        "inputs_embeds": outputs.hidden_states[0].cpu()[0],
+        "hidden_state": outputs.hidden_states[-1].cpu()[0],
+        "loss_mask": loss_mask.cpu(),
+    }
+    if spatial_stats is not None:
+        item["point_spatial_compression"] = spatial_stats
+    if compression_args is not None:
+        item = compress_point_tokens_in_item(
+            item,
+            point_patch_token=compression_args["point_patch_token"],
+            keep_ratio=compression_args["keep_ratio"],
+            summary_count=compression_args["summary_count"],
+            text_weight=compression_args["text_weight"],
+            group_centers=group_centers,
+            spatial_mode=compression_args["spatial_mode"],
+            octree_depth=compression_args["octree_depth"],
+            hierarchy_levels=compression_args["hierarchy_levels"],
+            density_weight=compression_args["density_weight"],
+            semantic_temperature=compression_args["semantic_temperature"],
+            query_mode=compression_args["query_mode"],
+        )
+    return item
+
+
+def write_data(outdir, data_point):
+    os.makedirs(outdir, exist_ok=True)
+    idx = len([name for name in os.listdir(outdir) if name.endswith(".ckpt")])
+    torch.save(data_point, os.path.join(outdir, f"data_{idx}.ckpt"))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-model-path", required=True)
+    parser.add_argument("--pointllm-repo-path", default=None)
+    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--anno-path", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=-1)
+    parser.add_argument("--pointnum", type=int, default=8192)
+    parser.add_argument("--conversation-types", default="simple_description")
+    parser.add_argument("--conv-mode", default="vicuna_v1_1")
+    parser.add_argument("--point-backbone-config-name", default=None)
+    parser.add_argument("--force-single-point-proj", action="store_true")
+    parser.add_argument("--torch-dtype", default="float16", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--point-token-keep-ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--point-token-keep-ratios",
+        default="",
+        help="Optional comma-separated ratios rotated across samples for multi-rate training.",
+    )
+    parser.add_argument("--point-token-summary-count", type=int, default=0)
+    parser.add_argument("--point-token-text-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--point-token-spatial-mode",
+        default="none",
+        choices=["none", "octree", "semantic_octree", "hierarchical_octree"],
+    )
+    parser.add_argument("--point-token-octree-depth", type=int, default=4)
+    parser.add_argument("--point-token-hierarchy-levels", default="1,2,4")
+    parser.add_argument("--point-token-density-weight", type=float, default=0.15)
+    parser.add_argument("--point-token-semantic-temperature", type=float, default=0.25)
+    parser.add_argument(
+        "--point-token-components",
+        default=os.environ.get("POINT_TOKEN_COMPONENTS", "geometry,semantic,summary"),
+        help="Comma-separated semantic octree components: geometry, semantic, summary.",
+    )
+    parser.add_argument(
+        "--point-token-query-mode",
+        default=os.environ.get("POINT_TOKEN_QUERY_MODE", "all"),
+        choices=["all", "prompt", "question"],
+        help="Text embedding query used to select point tokens. prompt excludes answer labels; question uses text after point tokens.",
+    )
+    parser.add_argument("--disable-point-token-compression", action="store_true")
+    parser.add_argument("--point-spatial-keep-ratio", type=float, default=1.0)
+    parser.add_argument("--point-spatial-num-points", type=int, default=0)
+    parser.add_argument("--point-spatial-min-points", type=int, default=0)
+    parser.add_argument("--disable-point-spatial-compression", action="store_true")
+    args = parser.parse_args()
+
+    dtype_mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_mapping[args.torch_dtype]
+
+    add_pointllm_to_path(args.pointllm_repo_path)
+    from pointllm.model import PointLLMLlamaForCausalLM
+    from pointllm.utils import disable_torch_init
+    import pointllm.model.pointllm as pointllm_modeling
+
+    disable_torch_init()
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path)
+    config = AutoConfig.from_pretrained(args.base_model_path)
+    if args.point_backbone_config_name:
+        config.point_backbone_config_name = args.point_backbone_config_name
+    if args.force_single_point_proj:
+        config.force_single_point_proj = True
+
+        original_cfg_from_yaml_file = pointllm_modeling.cfg_from_yaml_file
+
+        def cfg_from_yaml_file_single_proj(*cfg_args, **cfg_kwargs):
+            point_bert_config = original_cfg_from_yaml_file(*cfg_args, **cfg_kwargs)
+            point_bert_config.model.projection_hidden_layer = 0
+            if "projection_hidden_dim" in point_bert_config.model:
+                del point_bert_config.model.projection_hidden_dim
+            return point_bert_config
+
+        pointllm_modeling.cfg_from_yaml_file = cfg_from_yaml_file_single_proj
+
+    model = PointLLMLlamaForCausalLM.from_pretrained(
+        args.base_model_path,
+        config=config,
+        low_cpu_mem_usage=False,
+        torch_dtype=dtype,
+    )
+    load_checkpoint_tensors_by_prefix(model, args.base_model_path, prefixes=("model.point_proj.",))
+    model = model.cuda()
+    model.config.use_cache = True
+    model.initialize_tokenizer_point_backbone_config_wo_embedding(tokenizer)
+    model.eval()
+    model.get_model().last_point_group_centers = None
+    model.get_model().point_backbone.group_divider.register_forward_hook(
+        lambda module, inputs, output: setattr(
+            model.get_model(), "last_point_group_centers", output[1].detach()
+        )
+    )
+
+    point_backbone_config = model.get_model().point_backbone_config
+    spatial_compression_args = None
+    if not args.disable_point_spatial_compression and (
+        args.point_spatial_keep_ratio < 1.0 or args.point_spatial_num_points > 0
+    ):
+        min_points = args.point_spatial_min_points
+        if min_points <= 0:
+            min_points = max(1, int(point_backbone_config.get("point_token_len", 1)) - 1)
+        spatial_compression_args = {
+            "keep_ratio": args.point_spatial_keep_ratio,
+            "target_points": args.point_spatial_num_points,
+            "min_points": min_points,
+        }
+        print(f"[INFO] Point spatial FPS compression enabled: {spatial_compression_args}")
+
+    compression_args = None
+    if not args.disable_point_token_compression and (
+        args.point_token_keep_ratio < 1.0 or args.point_token_summary_count > 0
+    ):
+        compression_args = {
+            "point_patch_token": point_backbone_config["point_patch_token"],
+            "keep_ratio": args.point_token_keep_ratio,
+            "summary_count": args.point_token_summary_count,
+            "text_weight": args.point_token_text_weight,
+            "spatial_mode": args.point_token_spatial_mode,
+            "octree_depth": args.point_token_octree_depth,
+            "hierarchy_levels": tuple(
+                int(value) for value in args.point_token_hierarchy_levels.split(",") if value
+            ),
+            "density_weight": args.point_token_density_weight,
+            "semantic_temperature": args.point_token_semantic_temperature,
+            "query_mode": args.point_token_query_mode,
+            "components": args.point_token_components,
+        }
+        print(f"[INFO] Point token compression enabled: {compression_args}")
+    keep_ratios = [
+        float(value) for value in args.point_token_keep_ratios.split(",") if value.strip()
+    ]
+    if keep_ratios:
+        if compression_args is None:
+            raise ValueError("--point-token-keep-ratios requires point token compression.")
+        print(f"[INFO] Multi-rate point token training enabled: {keep_ratios}")
+
+    dataset, indices = build_dataset(args, tokenizer, point_backbone_config)
+    outdir = os.path.join(args.outdir, str(args.index))
+    for idx in tqdm(indices):
+        try:
+            sample_compression_args = compression_args
+            if compression_args is not None and keep_ratios:
+                sample_compression_args = dict(compression_args)
+                sample_compression_args["keep_ratio"] = keep_ratios[idx % len(keep_ratios)]
+            item = build_training_item(
+                model,
+                copy.deepcopy(dataset[idx]),
+                model.device,
+                dtype,
+                compression_args=sample_compression_args,
+                spatial_compression_args=spatial_compression_args,
+            )
+            if sample_compression_args is not None:
+                item["point_token_compression"]["training_keep_ratio"] = sample_compression_args[
+                    "keep_ratio"
+                ]
+            write_data(outdir, item)
+        except Exception as exc:
+            print(f"[WARN] skip index={idx}: {type(exc).__name__}: {repr(exc)}")
+
+
+if __name__ == "__main__":
+    main()
