@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate pointllm
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ROOT="${ROOT:-/root/eagle-eye-eval-point-compress-matboost}"
+CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
+if [[ -f "${CONDA_SH}" ]]; then
+  # shellcheck source=/dev/null
+  source "${CONDA_SH}"
+  conda activate "${CONDA_ENV:-pointllm}"
+fi
+
+ROOT="${ROOT:-${REPO_ROOT}}"
 cd "${ROOT}"
 RUN_ID="${RUN_ID:-semantic_octree_infer_ablation_$(date +%Y%m%d_%H%M%S)}"
 RESULT_ROOT="${RESULT_ROOT:-${ROOT}/results/semantic_octree_ablation/${RUN_ID}}"
-LOG_DIR="${LOG_DIR:-/root/autodl-tmp/pointllm_eagle_logs_${RUN_ID}}"
+LOG_DIR="${LOG_DIR:-${ROOT}/logs/pointllm_eagle_logs_${RUN_ID}}"
 mkdir -p "${RESULT_ROOT}" "${LOG_DIR}"
 MASTER_LOG="${RESULT_ROOT}/master.log"
 
-export PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/pointllm/bin/python}"
-export POINTLLM_REPO="${POINTLLM_REPO:-/root/autodl-tmp/pointLLM}"
-export BASE_MODEL="${BASE_MODEL:-/root/autodl-tmp/point7B_v1.1}"
-export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-/root/autodl-tmp/pointLLM/data/objaverse_data}"
-export VAL_JSON="${VAL_JSON:-/root/autodl-tmp/pointLLM/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
-export HEAD_DIR="${HEAD_DIR:-/root/autodl-tmp/pointllm_eagle_head_draft5_semantic_octree_5pct_full_bs32_20260616_2020}"
+export PYTHON_BIN="${PYTHON_BIN:-python}"
+export POINTLLM_REPO="${POINTLLM_REPO:-${ROOT}/third_party/pointLLM}"
+export BASE_MODEL="${BASE_MODEL:-${ROOT}/models/point7B_v1.1}"
+export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ROOT}/data/objaverse_data}"
+export VAL_JSON="${VAL_JSON:-${ROOT}/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
+export HEAD_DIR="${HEAD_DIR:-${ROOT}/outputs/pointllm_eagle_head_draft5_semantic_octree_5pct_full_bs32}"
 export TORCH_DTYPE="${TORCH_DTYPE:-float32}"
 export START="${START:-0}"
 export END="${END:--1}"

@@ -5,19 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 EAGLE_EYE_ROOT="${REPO_ROOT}/EAGLE_EYE"
 
-if [[ -d /root/autodl-tmp ]]; then
-  DEFAULT_POINTLLM_REPO="/root/autodl-tmp/pointLLM"
-  DEFAULT_BASE_MODEL="/root/autodl-tmp/point7B_v1.1"
-  DEFAULT_POINT_CLOUD_DATA="/root/autodl-tmp/pointLLM/data/objaverse_data"
-  DEFAULT_ANNOTATION="/root/autodl-tmp/pointLLM/data/anno_data/PointLLM_complex_instruction_70K.json"
-  DEFAULT_OUTPUT_DIR="/root/autodl-tmp/pointllm_eagle_data"
-else
-  DEFAULT_POINTLLM_REPO="/c/Users/lrz/PointLLM"
-  DEFAULT_BASE_MODEL="/f/download/point7B"
-  DEFAULT_POINT_CLOUD_DATA="/f/download/8192_npy"
-  DEFAULT_ANNOTATION="/f/download/PointLLM_complex_instruction_70K.json"
-  DEFAULT_OUTPUT_DIR="/f/download/pointllm_eagle_data"
-fi
+DEFAULT_POINTLLM_REPO="${REPO_ROOT}/third_party/pointLLM"
+DEFAULT_BASE_MODEL="${REPO_ROOT}/models/point7B_v1.1"
+DEFAULT_POINT_CLOUD_DATA="${REPO_ROOT}/data/objaverse_data"
+DEFAULT_ANNOTATION="${REPO_ROOT}/data/anno_data/PointLLM_complex_instruction_70K.json"
+DEFAULT_OUTPUT_DIR="${REPO_ROOT}/outputs/pointllm_eagle_data"
 
 POINTLLM_REPO="${POINTLLM_REPO:-${DEFAULT_POINTLLM_REPO}}"
 BASE_MODEL="${BASE_MODEL:-${DEFAULT_BASE_MODEL}}"

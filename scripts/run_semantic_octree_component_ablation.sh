@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /root/miniconda3/etc/profile.d/conda.sh
-conda activate pointllm
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ROOT="${ROOT:-/root/eagle-eye-eval-point-compress-matboost}"
+CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
+if [[ -f "${CONDA_SH}" ]]; then
+  # shellcheck source=/dev/null
+  source "${CONDA_SH}"
+  conda activate "${CONDA_ENV:-pointllm}"
+fi
+
+ROOT="${ROOT:-${REPO_ROOT}}"
 cd "${ROOT}"
 
 ABLATION_ID="${ABLATION_ID:-semantic_octree_components_$(date +%Y%m%d_%H%M%S)}"
@@ -13,12 +20,12 @@ mkdir -p "${RESULT_ROOT}"
 MASTER_LOG="${RESULT_ROOT}/master.log"
 AGG_JSON="${RESULT_ROOT}/all_summaries.json"
 
-export PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/pointllm/bin/python}"
-export POINTLLM_REPO="${POINTLLM_REPO:-/root/autodl-tmp/pointLLM}"
-export BASE_MODEL="${BASE_MODEL:-/root/autodl-tmp/point7B_v1.1}"
-export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-/root/autodl-tmp/pointLLM/data/objaverse_data}"
-export ANNOTATION="${ANNOTATION:-/root/autodl-tmp/pointLLM/data/anno_data/PointLLM_complex_instruction_70K.json}"
-export VAL_JSON="${VAL_JSON:-/root/autodl-tmp/pointLLM/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
+export PYTHON_BIN="${PYTHON_BIN:-python}"
+export POINTLLM_REPO="${POINTLLM_REPO:-${ROOT}/third_party/pointLLM}"
+export BASE_MODEL="${BASE_MODEL:-${ROOT}/models/point7B_v1.1}"
+export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ROOT}/data/objaverse_data}"
+export ANNOTATION="${ANNOTATION:-${ROOT}/data/anno_data/PointLLM_complex_instruction_70K.json}"
+export VAL_JSON="${VAL_JSON:-${ROOT}/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
 export CONVERSATION_TYPES="${CONVERSATION_TYPES:-single_round,multi_round,detailed_description}"
 
 export POINT_TOKEN_KEEP_RATIO="${POINT_TOKEN_KEEP_RATIO:-0.05}"
@@ -59,9 +66,9 @@ for i in "${!LABELS[@]}"; do
   comps="${COMPONENTS[$i]}"
   run_id="${ABLATION_ID}_${label}"
   export POINT_TOKEN_COMPONENTS="${comps}"
-  export DATA_DIR="/root/autodl-tmp/pointllm_eagle_data_${run_id}"
-  export HEAD_DIR="/root/autodl-tmp/pointllm_eagle_head_${run_id}"
-  export LOG_DIR="/root/autodl-tmp/pointllm_eagle_logs_${run_id}"
+  export DATA_DIR="${ROOT}/outputs/pointllm_eagle_data_${run_id}"
+  export HEAD_DIR="${ROOT}/outputs/pointllm_eagle_head_${run_id}"
+  export LOG_DIR="${ROOT}/logs/pointllm_eagle_logs_${run_id}"
   export OUT_JSONL="${RESULT_ROOT}/${label}/compare.jsonl"
   export SUMMARY_JSON="${RESULT_ROOT}/${label}/summary.json"
   mkdir -p "${RESULT_ROOT}/${label}" "${LOG_DIR}"
