@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODE_ROOT="${CODE_ROOT:-/insdata2/jiaming.fjm/lrz}"
+ASSET_ROOT="${ASSET_ROOT:-/lnt/workspace/jiaming.fjm/lrz}"
 
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
 if [[ -f "${CONDA_SH}" ]]; then
@@ -11,15 +13,15 @@ if [[ -f "${CONDA_SH}" ]]; then
   conda activate "${CONDA_ENV:-pointllm}"
 fi
 
-ROOT="${ROOT:-${REPO_ROOT}}"
+ROOT="${ROOT:-${CODE_ROOT}/PointLLM}"
 cd "${ROOT}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-DATA_DIR="${DATA_DIR:-${ROOT}/outputs/pointllm_eagle_data_draft5_${RUN_ID}}"
-HEAD_DIR="${HEAD_DIR:-${ROOT}/outputs/pointllm_eagle_head_draft5_${RUN_ID}}"
-LOG_DIR="${LOG_DIR:-${ROOT}/logs/pointllm_eagle_logs_draft5_${RUN_ID}}"
-OUT_JSONL="${OUT_JSONL:-${ROOT}/outputs/pointllm_compare_eagle_draft5_${RUN_ID}.jsonl}"
-SUMMARY_JSON="${SUMMARY_JSON:-${ROOT}/outputs/pointllm_compare_eagle_draft5_${RUN_ID}_summary.json}"
+DATA_DIR="${DATA_DIR:-${ASSET_ROOT}/outputs/pointllm_eagle_data_draft5_${RUN_ID}}"
+HEAD_DIR="${HEAD_DIR:-${ASSET_ROOT}/outputs/pointllm_eagle_head_draft5_${RUN_ID}}"
+LOG_DIR="${LOG_DIR:-${ASSET_ROOT}/logs/pointllm_eagle_logs_draft5_${RUN_ID}}"
+OUT_JSONL="${OUT_JSONL:-${ASSET_ROOT}/outputs/pointllm_compare_eagle_draft5_${RUN_ID}.jsonl}"
+SUMMARY_JSON="${SUMMARY_JSON:-${ASSET_ROOT}/outputs/pointllm_compare_eagle_draft5_${RUN_ID}_summary.json}"
 mkdir -p "${LOG_DIR}"
 
 echo "[draft5] run_id=${RUN_ID}"
@@ -28,11 +30,11 @@ echo "[draft5] head_dir=${HEAD_DIR}"
 echo "[draft5] log_dir=${LOG_DIR}"
 
 export PYTHON_BIN="${PYTHON_BIN:-python}"
-export POINTLLM_REPO="${POINTLLM_REPO:-${ROOT}/third_party/pointLLM}"
-export BASE_MODEL="${BASE_MODEL:-${ROOT}/models/point7B_v1.1}"
-export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ROOT}/data/objaverse_data}"
-export ANNOTATION="${ANNOTATION:-${ROOT}/data/anno_data/PointLLM_complex_instruction_70K.json}"
-export VAL_JSON="${VAL_JSON:-${ROOT}/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
+export POINTLLM_REPO="${POINTLLM_REPO:-${ASSET_ROOT}/pointLLM}"
+export BASE_MODEL="${BASE_MODEL:-${ASSET_ROOT}/point7B_v1.1}"
+export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ASSET_ROOT}/pointLLM/data/objaverse_data}"
+export ANNOTATION="${ANNOTATION:-${ASSET_ROOT}/pointLLM/data/anno_data/PointLLM_complex_instruction_70K.json}"
+export VAL_JSON="${VAL_JSON:-${ASSET_ROOT}/pointLLM/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
 export TORCH_DTYPE="${TORCH_DTYPE:-float16}"
 export CONVERSATION_TYPES="${CONVERSATION_TYPES:-single_round,multi_round,detailed_description}"
 

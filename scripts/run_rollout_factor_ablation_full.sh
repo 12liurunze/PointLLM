@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CODE_ROOT="${CODE_ROOT:-/insdata2/jiaming.fjm/lrz}"
+ASSET_ROOT="${ASSET_ROOT:-/lnt/workspace/jiaming.fjm/lrz}"
+ROOT="${ROOT:-${CODE_ROOT}/PointLLM}"
 cd "${ROOT}"
 
 CONDA_SH="${CONDA_SH:-${HOME}/miniconda3/etc/profile.d/conda.sh}"
@@ -13,17 +15,17 @@ if [[ -f "${CONDA_SH}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-rollout_factor_ablation_$(date +%Y%m%d_%H%M%S)}"
-DATA_DIR="${DATA_DIR:-outputs/pointllm_eagle_data_semantic_octree_5pct_10k}"
-OUT_ROOT="${OUT_ROOT:-outputs/rollout_ablation_full_combo/${RUN_ID}}"
-LOG_ROOT="${LOG_ROOT:-logs/rollout_ablation_full_combo/${RUN_ID}}"
+DATA_DIR="${DATA_DIR:-${ASSET_ROOT}/outputs/pointllm_eagle_data_semantic_octree_5pct_10k}"
+OUT_ROOT="${OUT_ROOT:-${ASSET_ROOT}/outputs/rollout_ablation_full_combo/${RUN_ID}}"
+LOG_ROOT="${LOG_ROOT:-${ASSET_ROOT}/logs/rollout_ablation_full_combo/${RUN_ID}}"
 mkdir -p "${OUT_ROOT}" "${LOG_ROOT}"
 
 export PYTHON_BIN="${PYTHON_BIN:-python}"
-export POINTLLM_REPO="${POINTLLM_REPO:-${ROOT}/third_party/pointLLM}"
-export BASE_MODEL="${BASE_MODEL:-${ROOT}/models/point7B_v1.1}"
-export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ROOT}/data/objaverse_data}"
-export ANNOTATION="${ANNOTATION:-${ROOT}/data/anno_data/PointLLM_complex_instruction_70K.json}"
-export VAL_JSON="${VAL_JSON:-${ROOT}/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
+export POINTLLM_REPO="${POINTLLM_REPO:-${ASSET_ROOT}/pointLLM}"
+export BASE_MODEL="${BASE_MODEL:-${ASSET_ROOT}/point7B_v1.1}"
+export POINT_CLOUD_DATA="${POINT_CLOUD_DATA:-${ASSET_ROOT}/pointLLM/data/objaverse_data}"
+export ANNOTATION="${ANNOTATION:-${ASSET_ROOT}/pointLLM/data/anno_data/PointLLM_complex_instruction_70K.json}"
+export VAL_JSON="${VAL_JSON:-${ASSET_ROOT}/pointLLM/data/anno_data/PointLLM_brief_description_val_200_GT.json}"
 export CONVERSATION_TYPES="${CONVERSATION_TYPES:-single_round,multi_round,detailed_description}"
 
 export POINT_TOKEN_KEEP_RATIO="${POINT_TOKEN_KEEP_RATIO:-0.05}"

@@ -4,12 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 EAGLE_EYE_ROOT="${REPO_ROOT}/EAGLE_EYE"
+ASSET_ROOT="${ASSET_ROOT:-/lnt/workspace/jiaming.fjm/lrz}"
 
-DEFAULT_POINTLLM_REPO="${REPO_ROOT}/third_party/pointLLM"
-DEFAULT_BASE_MODEL="${REPO_ROOT}/models/point7B_v1.1"
-DEFAULT_POINT_CLOUD_DATA="${REPO_ROOT}/data/objaverse_data"
-DEFAULT_ANNOTATION="${REPO_ROOT}/data/anno_data/PointLLM_complex_instruction_70K.json"
-DEFAULT_OUTPUT_DIR="${REPO_ROOT}/outputs/pointllm_eagle_data"
+DEFAULT_POINTLLM_REPO="${ASSET_ROOT}/pointLLM"
+DEFAULT_BASE_MODEL="${ASSET_ROOT}/point7B_v1.1"
+DEFAULT_POINT_CLOUD_DATA="${ASSET_ROOT}/pointLLM/data/objaverse_data"
+DEFAULT_ANNOTATION="${ASSET_ROOT}/pointLLM/data/anno_data/PointLLM_complex_instruction_70K.json"
+DEFAULT_OUTPUT_DIR="${ASSET_ROOT}/outputs/pointllm_eagle_data"
 
 POINTLLM_REPO="${POINTLLM_REPO:-${DEFAULT_POINTLLM_REPO}}"
 BASE_MODEL="${BASE_MODEL:-${DEFAULT_BASE_MODEL}}"
