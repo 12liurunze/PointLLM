@@ -1,160 +1,117 @@
-# Eagle eye
+# Semantic Octree Compression Ablation
 
-## 介绍
-目前Eagle-eye已经具备完成了训练以及推理部分的测试，表现出了一定的加速效果。目前兼容llava-v1.5-7b和Qwen2.5-VL-7B-Instruct两个模型。
+This project is an isolated PointLLM EAGLE compression project.
 
-## 安装 `eagle_eye` 
+Included:
 
-**新：为了适配qwen2.5vl，transformers>=4.49.0,这里建议选择4.51.1**
+- Semantic Octree point-token selection.
+- Geometry, semantic, and summary components.
+- Training-data generation.
+- Standard single-step EAGLE head training.
+- FP32 autoregressive versus EAGLE evaluation.
+- Point-cloud compression visualization.
+- Full compression ablation runner.
 
-```
-cd EAGLE_EYE
-pip install -e .
-```
-## 推理
+Excluded:
 
-我们提供的推理代码会自动分配模型权重（在多个 GPU 上加载模型），从而允许您运行超过单个 GPU 内存的模型。
+- Rollout loss and adaptive rollout.
+- Coverage-aware rollout.
+- Token-level rollout.
+- Point-grounded corrective rollout.
+- Global-token experiments.
+- Boundary and MAT-boost training modifications.
 
-**新：高版本transformers提供了chat_template，这里使用其来帮助进行推理。**
+## Project path
 
-### 使用代码
+Place this directory anywhere. The examples below assume:
 
-您可以使用我们提供的“eagenerate” 来加速生成，就像使用 Hugging Face 的 “generate” 一样。下面是一个示例。
-
-**新：推理过程中有一些要注意的问题**
-
-**1.qwen2.5vl当以torch.bfloat16加载模型时无论是否使用eagle推理，输出有概率会出现乱码（猜测是transformers的问题)，所以只支持以torch.float16来加载模型。**
-
-**2.Qwen2.5-VL-7B-Instruct在实际运行中显存占用会超过一张3090的显存，这里在使用qwen2.5vl推理时建议将device_map="auto"，保证有足够的显存，llava的话设置为"cuda:0"即可。**
-
-**3.一定要设置为attn_implementation="eager"，由于transformers默认使用SdpaAttention来进行推理，eagle的实现是基于普通的attention，所以要这样设置。**
-
-```python
-from eagle_eye.model.ee_model import EeModel
-
-import torch
-from PIL import Image
-import os
-import time
-
-# base_model_path = "/home/dhz/llava-v1.5-7b-hf"
-# ee_model_path = "/home/dhz/tmp_model/EAGLE-EYE-LLaVA-7B-10k"
-
-base_model_path = "/home/dhz/Qwen2.5-VL-7B-Instruct"
-ee_model_path = "/home/dhz/tmp_model/EAGLE-EYE-Qwen2.5vl-7B-10k"
-
-model = EeModel.from_pretrained(
-    base_model_path=base_model_path,
-    ee_model_path=ee_model_path,
-    torch_dtype=torch.float16,
-    low_cpu_mem_usage=True,
-    device_map="auto",
-    attn_implementation="eager"
-)
-model.eval()
-
-url = "/home/dhz/eagle-eye/EAGLE_EYE/eagle_eye/example.jpg"
-
-image = Image.open(url)
-
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": url,
-            },
-            {"type": "text", "text": "Describe the image in detail."},
-        ],
-    }
-]
-
-text = model.processor.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True
-) 
-
-inputs = model.processor(images=image, text=text , return_tensors='pt').to(model.base_model.device)
-
-output_ids = model.eagenerate(**inputs,temperature=0.0, max_new_tokens=200)
-
-output = model.processor.tokenizer.decode(output_ids[0][inputs.input_ids.shape[-1]:],skip_special_tokens=True)
-print(output)
-
+```text
+/lnt/workspace/jiaming.fjm/lrz/eagle-eye-semantic-octree-ablation-a100
 ```
 
-注意：LLaVA 和qwen2.5vl都是聊天模型。您需要使用正确的聊天模板，否则会导致模型输出异常，影响 EAGLE-EYE的性能。
 
+## Environment and paths
 
+The scripts now default to the requested 4 x A100 layout:
 
+```text
+POINTLLM_REPO=/lnt/workspace/jiaming.fjm/lrz/pointLLM
+BASE_MODEL=/lnt/workspace/jiaming.fjm/lrz/point7B_v1.1
+POINT_CLOUD_DATA=/lnt/workspace/jiaming.fjm/lrz/pointLLM/data/objaverse_data/8192_npy
+ANNO_DIR=/lnt/workspace/jiaming.fjm/lrz/pointLLM/data/anno_data
+CUDA_VISIBLE_DEVICES=0,1,2,3
+NUM_GPUS=4
+```
 
-## PointLLM Point-Cloud Double Compression
-
-The PointLLM path now supports two compression stages:
-
-- Spatial compression: FPS (farthest point sampling) runs before PointTransformer to reduce the raw point cloud.
-- Token compression: the EAGLE draft prompt keeps high-score point tokens and can add summary tokens for discarded point tokens.
-
-Common environment variables:
+Install the CUDA 12.8-oriented environment with:
 
 ```bash
-# Spatial FPS. If both are set, the smaller target is used.
-export POINT_SPATIAL_KEEP_RATIO=0.5
-export POINT_SPATIAL_NUM_POINTS=4096
-export POINT_SPATIAL_MIN_POINTS=512
-
-# Token-level compression.
-export POINT_TOKEN_KEEP_RATIO=0.5
-export POINT_TOKEN_SUMMARY_COUNT=8
-export POINT_TOKEN_TEXT_WEIGHT=0.5
+cd EAGLE_EYE
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+pip install -e .
 ```
 
-`scripts/pointllm_generate_data.sh` forwards both spatial and token compression settings to the data generator. During inference/evaluation, `PointEeModel` reads the same environment variables. Use `DISABLE_POINT_SPATIAL_COMPRESSION=1` or `DISABLE_POINT_TOKEN_COMPRESSION=1` to turn off either stage.
+Training is launched through `python -m torch.distributed.run --nproc_per_node=${NUM_GPUS}`.
+`BATCH_SIZE` is interpreted as per-GPU batch size; the default is 8, so the default global batch size is 32 on 4 GPUs.
+Data generation is also split into four independent ranges, one per GPU.
+FP32 speed evaluation intentionally remains single-GPU so timing stays comparable
+to the autoregressive baseline.
 
-## 训练
+## Full ablation
 
-### 生成训练数据
+```bash
+cd /lnt/workspace/jiaming.fjm/lrz/eagle-eye-semantic-octree-ablation-a100
 
-您可以执行以下命令来生成训练数据。
-
-```python
-cd ge_data/
-python get_data_all_llava.py -outdir [path of data]
-
-python get_data_all_qwen2.5vl.py -outdir [path of data]
+nohup bash scripts/run_semantic_octree_full_ablation.sh \
+  > /lnt/workspace/jiaming.fjm/lrz/semantic_octree_full_ablation.log 2>&1 &
 ```
 
-### 训练自回归头
+The default run performs 18 independently trained experiments:
 
-```
-cd train/
-python train_llava.py --tmpdir [path of data]\
---cpdir [path of checkpoints] -- configpath [path of config file]
+- Uncompressed baseline.
+- Seven non-empty combinations of geometry, semantic, and summary.
+- Keep ratios: 1%, 3%, 5%, 10%, 25%.
+- Summary counts: 0, 4, 8, 16.
+- Octree depths: 2, 3, 4, 5.
 
-python train_qwenvl2.5.py --tmpdir [path of data]\
---cpdir [path of checkpoints] -- configpath [path of config file]
-```
+The standard `5% + 8 summaries + depth 4` configuration is reused as the
+center point and is not duplicated in each sweep.
 
-## 评估
+Run selected groups:
 
-您可以使用以下命令在COCO-caption上测试EAGLE-EYE的速度。
-
-```
-cd evaluation/
-python gen_ee_answer_llava.py  --ee-model-path [path of EAGLE-EYE weight]\ --base-model-path [path of the original model]\
-
-python gen_ee_answer_qwen2.5vl_video.py  --ee-model-path [/root/autodl-tmp/qwen]\ --base-model-path [/root/autodl-tmp/qwen2.5vl]\
+```bash
+ABLATION_GROUPS=baseline,components \
+bash scripts/run_semantic_octree_full_ablation.sh
 ```
 
-如果你需要特定的加速比，你还需要运行以下命令来获取原版自动回归的速度。
+Useful overrides:
 
+```bash
+END=10000
+NUM_EPOCHS=8
+BATCH_SIZE=8   # per GPU; 4 GPUs => global batch 32
+KEEP_DATA=0
+KEEP_HEADS=1
 ```
-python  gen_baseline_answer_llava.py -ee-model-path [path of EAGLE-EYE weight]\ --base-model-path [path of the original model]\
 
+Results are written to:
 
-python  gen_baseline_answer_qwen2.5vl.py -ee-model-path [path of EAGLE-EYE weight]\ --base-model-path [path of the original model]\
+```text
+results/semantic_octree_ablation/<run_id>/
 ```
 
-以上两个命令都会生成一个 .jsonl 文件，记录生成结果和实际时间。然后，您可以使用 evaluation/speed.py 来计算速度比率。
+Training data and heads are written under:
+
+```text
+/lnt/workspace/jiaming.fjm/lrz/semantic_octree_ablation_runs/<run_id>/
+```
+
+## Smoke test
+
+```bash
+START=0 END=8 EVAL_START=0 EVAL_END=2 \
+NUM_EPOCHS=1 BATCH_SIZE=2 \
+ABLATION_GROUPS=components \
+bash scripts/run_semantic_octree_full_ablation.sh
+```

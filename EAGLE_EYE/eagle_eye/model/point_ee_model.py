@@ -265,18 +265,6 @@ class PointEeModel(nn.Module):
         groups = [group for group in torch.tensor_split(order, chunks) if group.numel() > 0]
         return self._pool_semantic_groups(values, scores if use_semantic else None, groups)
 
-    @staticmethod
-    def _global_point_summary(values, scores):
-        if values.shape[0] == 0:
-            return values[:0]
-        temperature = float(os.environ.get("POINT_TOKEN_SEMANTIC_TEMPERATURE", "0.25"))
-        if scores is None:
-            pooled = values.float().mean(dim=0, keepdim=True)
-        else:
-            weights = torch.softmax(scores.float() / max(temperature, 1e-4), dim=0)
-            pooled = torch.sum(values.float() * weights[:, None], dim=0, keepdim=True)
-        return pooled.to(values.dtype)
-
     def _semantic_octree_summary(self, values, centers, scores, chunks):
         if values.shape[0] == 0 or chunks <= 0:
             return values[:0]
@@ -298,7 +286,6 @@ class PointEeModel(nn.Module):
 
         keep_ratio = float(os.environ.get("POINT_TOKEN_KEEP_RATIO", "1.0"))
         summary_count = int(os.environ.get("POINT_TOKEN_SUMMARY_COUNT", "0"))
-        global_count = int(os.environ.get("POINT_TOKEN_GLOBAL_COUNT", "0"))
         spatial_mode = os.environ.get("POINT_TOKEN_SPATIAL_MODE", "none").lower()
         component_set = self._parse_point_token_components()
         use_geometry = "geometry" in component_set
@@ -306,9 +293,6 @@ class PointEeModel(nn.Module):
         use_summary = "summary" in component_set
         if not use_summary:
             summary_count = 0
-        global_count = max(0, min(global_count, 1))
-        if os.environ.get("POINT_TOKEN_GLOBAL_REPLACE_SUMMARY", "0") == "1" and global_count > 0:
-            summary_count = max(0, summary_count - global_count)
         group_centers = getattr(model, "last_point_group_centers", None)
 
         compressed_ids = []
@@ -364,13 +348,6 @@ class PointEeModel(nn.Module):
             selected_mask = torch.zeros(point_count, dtype=torch.bool, device=cur_ids.device)
             selected_mask[selected_local] = True
             remaining_local = (~selected_mask).nonzero(as_tuple=False).flatten()
-            global_features = cur_point_features[:0]
-            global_hidden = cur_point_hidden[:0]
-            global_ids = cur_ids[:0]
-            if global_count > 0:
-                global_features = self._global_point_summary(cur_point_features, scores)
-                global_hidden = self._global_point_summary(cur_point_hidden, scores)
-                global_ids = torch.full((global_features.shape[0],), int(point_cfg["point_patch_token"]), dtype=cur_ids.dtype, device=cur_ids.device)
             summary_features = cur_point_features[:0]
             summary_hidden = cur_point_hidden[:0]
             summary_ids = cur_ids[:0]
@@ -431,9 +408,8 @@ class PointEeModel(nn.Module):
                 {
                     "original_point_tokens": point_count,
                     "selected_point_tokens": int(keep_count),
-                    "global_tokens": int(global_ids.shape[0]),
                     "summary_tokens": int(summary_ids.shape[0]),
-                    "compressed_point_tokens": int(keep_count + global_ids.shape[0] + summary_ids.shape[0]),
+                    "compressed_point_tokens": int(keep_count + summary_ids.shape[0]),
                     "components": ",".join(sorted(component_set)),
                 }
             )
@@ -447,8 +423,6 @@ class PointEeModel(nn.Module):
             cur_embeds_with_points[point_indices] = cur_point_features.to(
                 device=cur_embeds.device, dtype=cur_embeds.dtype
             )
-            global_features = global_features.to(device=cur_embeds.device, dtype=cur_embeds.dtype)
-            global_hidden = global_hidden.to(device=cur_hidden.device, dtype=cur_hidden.dtype)
             summary_features = summary_features.to(device=cur_embeds.device, dtype=cur_embeds.dtype)
             summary_hidden = summary_hidden.to(device=cur_hidden.device, dtype=cur_hidden.dtype)
 
@@ -456,7 +430,6 @@ class PointEeModel(nn.Module):
                 torch.cat(
                     (
                         cur_ids[: first_point_pos + 1][prefix_mask],
-                        global_ids,
                         summary_ids,
                         cur_ids[first_point_pos + 1 :][suffix_mask],
                     ),
@@ -467,7 +440,6 @@ class PointEeModel(nn.Module):
                 torch.cat(
                     (
                         cur_embeds_with_points[: first_point_pos + 1][prefix_mask],
-                        global_features,
                         summary_features,
                         cur_embeds_with_points[first_point_pos + 1 :][suffix_mask],
                     ),
@@ -478,7 +450,6 @@ class PointEeModel(nn.Module):
                 torch.cat(
                     (
                         cur_hidden[: first_point_pos + 1][prefix_mask],
-                        global_hidden,
                         summary_hidden,
                         cur_hidden[first_point_pos + 1 :][suffix_mask],
                     ),
@@ -496,7 +467,6 @@ class PointEeModel(nn.Module):
             "compressed_prompt_len": int(draft_ids.shape[1]),
             "keep_ratio": keep_ratio,
             "summary_count": summary_count,
-            "global_count": global_count,
             "spatial_mode": spatial_mode,
             "components": ",".join(sorted(component_set)),
             "batch": batch_token_stats,

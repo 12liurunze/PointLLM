@@ -6,13 +6,13 @@ from typing import Any, Dict, List
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoConfig, get_linear_schedule_with_warmup
 
 from eagle_eye.model.cnets import Model
 from eagle_eye.model.configs import EConfig
@@ -100,27 +100,11 @@ class CustomDataset(Dataset):
 
         input_ids_target = torch.cat((input_ids[:, 1:], torch.zeros(1, 1, dtype=input_ids.dtype)), dim=1)
         inputs_embeds_target = torch.cat(
-            (
-                inputs_embeds[:, 1:, :],
-                torch.zeros(1, 1, inputs_embeds.shape[2], dtype=inputs_embeds.dtype),
-            ),
+            (inputs_embeds[:, 1:, :], torch.zeros(1, 1, inputs_embeds.shape[2])),
             dim=1,
         )
-        target = torch.cat(
-            (
-                hidden_state[:, 1:, :],
-                torch.zeros(1, 1, hidden_state.shape[2], dtype=hidden_state.dtype),
-            ),
-            dim=1,
-        )
+        target = torch.cat((hidden_state[:, 1:, :], torch.zeros(1, 1, hidden_state.shape[2])), dim=1)
 
-        compression = data.get("point_token_compression", {})
-        coverage_score = float(
-            compression.get(
-                "coverage_score",
-                compression.get("coverage_cell_ratio", 1.0),
-            )
-        )
         new_data = {
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
@@ -128,77 +112,17 @@ class CustomDataset(Dataset):
             "hidden_state_big": hidden_state,
             "input_ids": input_ids_target,
             "inputs_embeds": inputs_embeds_target,
-            "point_coverage_score": coverage_score,
         }
         if self.transform:
             new_data = self.transform(new_data)
         return new_data
 
 
-
-
-def _batch_normalized(score, eps=1e-6):
-    score = score.float()
-    mean = score.detach().mean().clamp_min(eps)
-    return (score / mean).clamp(0.5, 2.0)
-
-
-def build_point_rollout_factor(args, data, token_weight, visual_token_lookup, target_p):
-    if not args.point_rollout_adaptive:
-        return None
-
-    token_weight = token_weight.float()
-    denom = token_weight.sum(dim=1).clamp_min(1e-5)
-
-    # Long answers carry more compounding draft errors, so rollout is emphasized there.
-    length_score = _batch_normalized(denom.sqrt())
-
-    # Teacher confidence proxies visual/text uncertainty without needing extra labels.
-    teacher_conf = target_p.max(dim=2).values.detach()
-    uncertainty = ((1.0 - teacher_conf) * token_weight).sum(dim=1) / denom
-    uncertainty_score = _batch_normalized(uncertainty)
-
-    # Point-cloud ambiguity proxy: compressed visual token embeddings with higher variance
-    # usually correspond to more heterogeneous scenes or harder token selection.
-    visual_score = torch.ones_like(length_score)
-    if "input_ids" in data and "inputs_embeds" in data:
-        ids = data["input_ids"].to(token_weight.device).clamp(min=0, max=visual_token_lookup.numel() - 1)
-        visual_mask = visual_token_lookup[ids].bool()
-        embeds = data["inputs_embeds"].to(token_weight.device).float()
-        scores = []
-        for batch_idx in range(embeds.shape[0]):
-            cur = embeds[batch_idx][visual_mask[batch_idx]]
-            if cur.shape[0] <= 1:
-                scores.append(embeds.new_tensor(1.0))
-            else:
-                center = cur.mean(dim=0, keepdim=True)
-                scores.append((cur - center).pow(2).mean().sqrt())
-        visual_score = _batch_normalized(torch.stack(scores).to(token_weight.device))
-
-    coverage_score = torch.ones_like(length_score)
-    if args.rollout_coverage_weight > 0 and "point_coverage_score" in data:
-        coverage = data["point_coverage_score"].to(token_weight.device).float().clamp(0.0, 1.0)
-        coverage_difficulty = (1.0 - coverage).clamp_min(1e-4)
-        coverage_score = _batch_normalized(coverage_difficulty)
-
-    factor = (
-        1.0
-        + args.rollout_length_weight * (length_score - 1.0)
-        + args.rollout_uncertainty_weight * (uncertainty_score - 1.0)
-        + args.rollout_visual_weight * (visual_score - 1.0)
-        + args.rollout_coverage_weight * (coverage_score - 1.0)
-    )
-    return factor.clamp(args.rollout_adaptive_min, args.rollout_adaptive_max).detach()
-
-
 class DataCollatorWithPadding:
     @staticmethod
     def paddingtensor(intensors, length):
         _, n, dim = intensors.shape
-        return torch.cat(
-            (intensors, torch.zeros(1, length - n, dim, dtype=intensors.dtype)),
-            dim=1,
-        )
+        return torch.cat((intensors, torch.zeros(1, length - n, dim)), dim=1)
 
     @staticmethod
     def paddingtensor2d(intensors, length):
@@ -218,48 +142,7 @@ class DataCollatorWithPadding:
             "attention_mask": torch.tensor(
                 [item["attention_mask"] + [0] * (max_length - len(item["attention_mask"])) for item in features]
             ),
-            "point_coverage_score": torch.tensor(
-                [float(item.get("point_coverage_score", 1.0)) for item in features], dtype=torch.float32
-            ),
         }
-
-
-POINT_VISUAL_KEYWORDS = (
-    "object", "shape", "color", "colour", "red", "blue", "green", "yellow", "black", "white",
-    "brown", "gray", "grey", "orange", "purple", "pink", "round", "rect", "square", "cube",
-    "cubic", "cylinder", "cylind", "sphere", "spherical", "cone", "flat", "thin", "thick",
-    "long", "short", "wide", "narrow", "tall", "small", "large", "front", "back", "top",
-    "bottom", "side", "left", "right", "under", "over", "above", "below", "beside", "inside",
-    "outside", "attached", "connected", "part", "handle", "wheel", "leg", "arm", "seat", "chair",
-    "table", "car", "truck", "bus", "train", "airplane", "plane", "boat", "house", "roof",
-    "door", "window", "body", "head", "tail", "wing", "base", "stand", "pole", "box", "toy",
-    "cartoon", "wood", "wooden", "metal", "plastic", "glass", "material", "texture", "surface",
-)
-
-
-def build_visual_token_lookup(tokenizer, vocab_size, extra_keywords=None):
-    keywords = list(POINT_VISUAL_KEYWORDS)
-    if extra_keywords:
-        keywords.extend(word.strip().lower() for word in extra_keywords.split(",") if word.strip())
-    lookup = torch.zeros(vocab_size, dtype=torch.float32)
-    for token_id in range(vocab_size):
-        pieces = []
-        try:
-            piece = tokenizer.convert_ids_to_tokens(token_id)
-            if piece is not None:
-                pieces.append(str(piece))
-        except Exception:
-            pass
-        try:
-            decoded = tokenizer.decode([token_id], skip_special_tokens=True)
-            if decoded:
-                pieces.append(decoded)
-        except Exception:
-            pass
-        text = " ".join(pieces).lower()
-        if any(keyword in text for keyword in keywords):
-            lookup[token_id] = 1.0
-    return lookup
 
 
 def save_eagle_head(accelerator, model, config, outdir):
@@ -291,25 +174,6 @@ def main():
     parser.add_argument("--noise-std", type=float, default=0.2)
     parser.add_argument("--no-data-noise", action="store_true")
     parser.add_argument("--mixed-precision", default="bf16", choices=["no", "fp16", "bf16"])
-    parser.add_argument("--init-head", default=None)
-    parser.add_argument("--acceptance-margin-weight", type=float, default=0.0)
-    parser.add_argument("--acceptance-margin", type=float, default=1.0)
-    parser.add_argument("--max-files", type=int, default=0, help="Use only the first N training files for quick MAT experiments.")
-    parser.add_argument("--point-aware-weight", type=float, default=0.0, help="Enable point-aware token weighting when > 0.")
-    parser.add_argument("--visual-token-weight", type=float, default=1.0)
-    parser.add_argument("--uncertainty-weight", type=float, default=1.0)
-    parser.add_argument("--uncertainty-margin", type=float, default=2.0)
-    parser.add_argument("--visual-keywords", default=None)
-    parser.add_argument("--rollout-steps", type=int, default=1, help="Train draft on its own multi-step hidden trajectory.")
-    parser.add_argument("--rollout-weight", type=float, default=0.0)
-    parser.add_argument("--rollout-decay", type=float, default=0.7)
-    parser.add_argument("--point-rollout-adaptive", action="store_true", help="Weight rollout by point-scene difficulty, answer length, and teacher uncertainty.")
-    parser.add_argument("--rollout-length-weight", type=float, default=0.25)
-    parser.add_argument("--rollout-uncertainty-weight", type=float, default=0.35)
-    parser.add_argument("--rollout-visual-weight", type=float, default=0.25)
-    parser.add_argument("--rollout-coverage-weight", type=float, default=0.0, help="Increase rollout weight for samples with poor semantic-octree coverage.")
-    parser.add_argument("--rollout-adaptive-min", type=float, default=0.7)
-    parser.add_argument("--rollout-adaptive-max", type=float, default=1.8)
     args = parser.parse_args()
 
     add_pointllm_to_path(args.pointllm_repo_path)
@@ -320,14 +184,19 @@ def main():
         pass
 
     set_seed(0)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[ddp_kwargs],
     )
+    if accelerator.is_main_process:
+        print(
+            f"[train_pointllm] distributed world_size={accelerator.num_processes} "
+            f"per_device_batch_size={args.bs} mixed_precision={args.mixed_precision}"
+        )
 
     datapath = list_files(args.tmpdir)
-    if args.max_files and args.max_files > 0:
-        datapath = datapath[: args.max_files]
     if len(datapath) < 2:
         raise ValueError(f"Need at least two training files under {args.tmpdir}, got {len(datapath)}")
 
@@ -365,16 +234,6 @@ def main():
         baseconfig, "max_position_embeddings", config.max_position_embeddings
     )
     model = Model(config, load_emb=True, path=args.basepath)
-    if args.init_head:
-        init_path = args.init_head
-        if os.path.isdir(init_path):
-            init_path = os.path.join(init_path, "model.safetensors")
-        incompatible = model.load_state_dict(load_file(init_path, device="cpu"), strict=False)
-        print(
-            f"[INFO] Initialized draft head from {init_path}; "
-            f"missing={len(incompatible.missing_keys)} "
-            f"unexpected={len(incompatible.unexpected_keys)}"
-        )
 
     hidden_size = getattr(baseconfig, "hidden_size", config.hidden_size)
     vocab_size = getattr(baseconfig, "vocab_size", config.vocab_size)
@@ -384,23 +243,19 @@ def main():
     for param in head.parameters():
         param.requires_grad = False
 
-    tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-    visual_token_lookup = build_visual_token_lookup(tokenizer, vocab_size, args.visual_keywords)
-    print(f"[INFO] point-aware visual token ids: {int(visual_token_lookup.sum().item())}/{vocab_size}")
-
     criterion = nn.SmoothL1Loss(reduction="none")
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
+    model, head, optimizer, train_loader, test_loader = accelerator.prepare(
+        model, head, optimizer, train_loader, test_loader
+    )
+    # Accelerate shards each loader across ranks. Build the scheduler after
+    # preparation so its step count matches the actual per-rank iterations.
     total_steps = max(1, args.num_epochs * len(train_loader))
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=min(args.num_warmup_steps, total_steps),
         num_training_steps=total_steps,
     )
-
-    model, head, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
-        model, head, optimizer, train_loader, test_loader, scheduler
-    )
-    visual_token_lookup = visual_token_lookup.to(accelerator.device)
 
     for epoch in range(args.num_epochs):
         model.train()
@@ -409,103 +264,24 @@ def main():
         for data in tqdm(train_loader, disable=not accelerator.is_local_main_process):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                model_dtype = next(model.parameters()).dtype
                 predict = model(
-                    data["hidden_states"].to(model_dtype),
+                    data["hidden_states"],
                     input_ids=data["input_ids"],
-                    inputs_embeds=data["inputs_embeds"].to(model_dtype),
+                    inputs_embeds=data["inputs_embeds"],
                     attention_mask=data["attention_mask"],
                 )
                 with torch.no_grad():
-                    target = data["target"].to(model_dtype)
-                    target_head = head(target).float()
+                    target_head = head(data["target"]).float()
                     target_p = nn.Softmax(dim=2)(target_head).detach()
                 out_head = head(predict).float()
                 out_logp = nn.LogSoftmax(dim=2)(out_head)
-                teacher_top2 = torch.topk(target_head, k=2, dim=-1)
-                token_weight = data["loss_mask"].float().to(out_head.device)
-                if args.point_aware_weight > 0:
-                    target_ids = data["input_ids"].to(out_head.device).clamp(min=0, max=vocab_size - 1)
-                    visual_mask = visual_token_lookup[target_ids].float()
-                    teacher_margin = teacher_top2.values[..., 0] - teacher_top2.values[..., 1]
-                    uncertainty = torch.relu(args.uncertainty_margin - teacher_margin) / max(args.uncertainty_margin, 1e-5)
-                    risk = args.visual_token_weight * visual_mask + args.uncertainty_weight * uncertainty
-                    token_weight = token_weight * (1.0 + args.point_aware_weight * risk)
-                loss_mask = token_weight[:, :, None]
-                ploss_token = -torch.sum(target_p * out_logp, 2)
-                rollout_factor = build_point_rollout_factor(
-                    args, data, token_weight, visual_token_lookup, target_p
+                loss_mask = data["loss_mask"][:, :, None]
+                ploss = -torch.sum(torch.sum(loss_mask * target_p * out_logp, 2)) / (
+                    loss_mask.sum() + 1e-5
                 )
-                ploss = torch.sum(token_weight * ploss_token) / (token_weight.sum() + 1e-5)
-                vloss = criterion(predict, target)
-                vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (token_weight.sum() + 1e-5)
-                teacher_token = teacher_top2.indices[..., 0]
-                teacher_confidence = torch.sigmoid(
-                    teacher_top2.values[..., 0] - teacher_top2.values[..., 1]
-                )
-                student_top2 = torch.topk(out_head, k=2, dim=-1)
-                positive = out_head.gather(-1, teacher_token[..., None]).squeeze(-1)
-                strongest_negative = torch.where(
-                    student_top2.indices[..., 0] == teacher_token,
-                    student_top2.values[..., 1],
-                    student_top2.values[..., 0],
-                )
-                token_mask = token_weight
-                acceptance_margin_loss = (
-                    torch.relu(args.acceptance_margin - positive + strongest_negative)
-                    * teacher_confidence
-                    * token_mask
-                ).sum() / (token_mask.sum() + 1e-5)
-                rollout_loss = out_head.new_tensor(0.0)
-                if args.rollout_weight > 0 and args.rollout_steps > 1:
-                    rollout_hidden = predict
-                    for rollout_index in range(2, args.rollout_steps + 1):
-                        if rollout_hidden.shape[1] <= 1:
-                            break
-                        rollout_hidden = rollout_hidden[:, :-1, :]
-                        rollout_input_ids = data["input_ids"][:, rollout_index - 1 :]
-                        rollout_inputs_embeds = data["inputs_embeds"][:, rollout_index - 1 :, :].to(model_dtype)
-                        rollout_attention = data["attention_mask"][:, rollout_index - 1 :]
-                        rollout_target = data["target"][:, rollout_index - 1 :, :].to(model_dtype)
-                        rollout_token_weight = token_weight[:, rollout_index - 1 :]
-                        common_len = min(
-                            rollout_hidden.shape[1],
-                            rollout_input_ids.shape[1],
-                            rollout_inputs_embeds.shape[1],
-                            rollout_target.shape[1],
-                            rollout_token_weight.shape[1],
-                        )
-                        if common_len <= 0:
-                            break
-                        rollout_hidden = rollout_hidden[:, :common_len, :]
-                        rollout_input_ids = rollout_input_ids[:, :common_len]
-                        rollout_inputs_embeds = rollout_inputs_embeds[:, :common_len, :]
-                        rollout_attention = rollout_attention[:, :common_len]
-                        rollout_target = rollout_target[:, :common_len, :]
-                        rollout_token_weight = rollout_token_weight[:, :common_len]
-                        rollout_pred = model(
-                            rollout_hidden,
-                            input_ids=rollout_input_ids,
-                            inputs_embeds=rollout_inputs_embeds,
-                            attention_mask=rollout_attention,
-                        )
-                        with torch.no_grad():
-                            rollout_target_p = nn.Softmax(dim=2)(head(rollout_target).float()).detach()
-                        rollout_logp = nn.LogSoftmax(dim=2)(head(rollout_pred).float())
-                        rollout_ploss_token = -torch.sum(rollout_target_p * rollout_logp, 2)
-                        sample_denom = rollout_token_weight.sum(dim=1).clamp_min(1e-5)
-                        sample_loss = torch.sum(rollout_token_weight * rollout_ploss_token, dim=1) / sample_denom
-                        if rollout_factor is not None:
-                            sample_loss = sample_loss * rollout_factor[: sample_loss.shape[0]]
-                        step_loss = sample_loss.mean()
-                        rollout_loss = rollout_loss + (args.rollout_decay ** (rollout_index - 2)) * step_loss
-                        rollout_hidden = rollout_pred
-                loss = (
-                    args.v_w * vloss
-                    + args.p_w * ploss
-                    + args.acceptance_margin_weight * acceptance_margin_loss
-                    + args.rollout_weight * rollout_loss
-                )
+                vloss = criterion(predict, data["target"])
+                vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
+                loss = args.v_w * vloss + args.p_w * ploss
                 accelerator.backward(loss)
                 accelerator.clip_grad_value_(model.parameters(), args.grad_clip)
                 optimizer.step()
@@ -513,43 +289,46 @@ def main():
             train_loss += loss.detach().float().item()
             train_batches += 1
 
-        if accelerator.is_local_main_process:
-            print(f"Epoch {epoch + 1}/{args.num_epochs} train_loss={train_loss / max(train_batches, 1):.4f}")
+        train_stats = torch.tensor(
+            [train_loss, float(train_batches)],
+            device=accelerator.device,
+            dtype=torch.float64,
+        )
+        train_stats = accelerator.reduce(train_stats, reduction="sum")
+        if accelerator.is_main_process:
+            print(
+                f"Epoch {epoch + 1}/{args.num_epochs} "
+                f"train_loss={train_stats[0].item() / max(train_stats[1].item(), 1.0):.4f}"
+            )
 
         if (epoch + 1) % args.save_freq == 0 or epoch + 1 == args.num_epochs:
             model.eval()
-            eval_loss = 0.0
-            eval_batches = 0
-            eval_correct = 0.0
-            eval_tokens = 0.0
+            eval_loss_numerator = torch.zeros((), device=accelerator.device)
+            eval_token_count = torch.zeros((), device=accelerator.device)
             for data in tqdm(test_loader, disable=not accelerator.is_local_main_process):
                 with torch.no_grad():
-                    model_dtype = next(model.parameters()).dtype
                     predict = model(
-                        data["hidden_states"].to(model_dtype),
+                        data["hidden_states"],
                         input_ids=data["input_ids"],
-                        inputs_embeds=data["inputs_embeds"].to(model_dtype),
+                        inputs_embeds=data["inputs_embeds"],
                         attention_mask=data["attention_mask"],
                     )
-                    target_head = head(data["target"].to(model_dtype)).float()
+                    target_head = head(data["target"]).float()
                     target_p = nn.Softmax(dim=2)(target_head).detach()
                     out_logp = nn.LogSoftmax(dim=2)(head(predict).float())
                     loss_mask = data["loss_mask"][:, :, None]
-                    ploss = -torch.sum(torch.sum(loss_mask * target_p * out_logp, 2)) / (
-                        loss_mask.sum() + 1e-5
+                    eval_loss_numerator += -torch.sum(
+                        torch.sum(loss_mask * target_p * out_logp, 2)
                     )
-                    token_mask = data["loss_mask"].bool()
-                    eval_correct += (
-                        (out_logp.argmax(dim=-1) == target_head.argmax(dim=-1)) & token_mask
-                    ).sum().item()
-                    eval_tokens += token_mask.sum().item()
-                    eval_loss += ploss.detach().float().item()
-                    eval_batches += 1
-            if accelerator.is_local_main_process:
+                    eval_token_count += loss_mask.sum()
+            eval_stats = torch.stack(
+                (eval_loss_numerator.double(), eval_token_count.double())
+            )
+            eval_stats = accelerator.reduce(eval_stats, reduction="sum")
+            if accelerator.is_main_process:
                 print(
                     f"Epoch {epoch + 1}/{args.num_epochs} "
-                    f"eval_ploss={eval_loss / max(eval_batches, 1):.4f} "
-                    f"eval_top1={eval_correct / max(eval_tokens, 1):.4f}"
+                    f"eval_ploss={eval_stats[0].item() / max(eval_stats[1].item(), 1.0):.4f}"
                 )
                 save_eagle_head(accelerator, model, config, args.cpdir)
             accelerator.wait_for_everyone()

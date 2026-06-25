@@ -1,22 +1,9 @@
-# heavy runtime artifacts
-results/
-EAGLE_EYE/results/
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.bin
-*.npy
-*.npz
-*.jsonl
+__pycache__/
+*.py[cod]
 *.log
 
-# python/cache
-__pycache__/
-*.pyc
-.pytest_cache/
+.venv/
+venv/
 
-# local env/runtime
-.env
-wandb/
-runs/
+results/*
+!results/.gitkeep

@@ -1,10 +1,24 @@
-#torch==2.2.1
+# CUDA 12.8 / A100-friendly stack for Python 3.10 or 3.11.
+# PyTorch CUDA wheels are resolved from the official cu128 index while
+# non-PyTorch packages fall back to PyPI.
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 transformers==4.51.1
 accelerate==1.6.0
+safetensors>=0.4.5
+numpy>=1.24,<2.0
+tqdm>=4.66
+einops>=0.7
+pyyaml>=6.0
+matplotlib>=3.7
 fschat==0.2.31
 gradio==3.50.2
 openai==0.28.0
 anthropic==0.5.0
 sentencepiece==0.1.99
-protobuf==3.19.0
-wandb
+protobuf>=3.20.3,<5
+wandb>=0.16
