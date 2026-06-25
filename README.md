@@ -67,16 +67,14 @@ nohup bash scripts/run_semantic_octree_full_ablation.sh \
   > /lnt/workspace/jiaming.fjm/lrz/semantic_octree_full_ablation.log 2>&1 &
 ```
 
-The default run performs 18 independently trained experiments:
+The default run performs 10 independently trained experiments:
 
 - Uncompressed baseline.
 - Seven non-empty combinations of geometry, semantic, and summary.
-- Keep ratios: 1%, 3%, 5%, 10%, 25%.
-- Summary counts: 0, 4, 8, 16.
-- Octree depths: 2, 3, 4, 5.
+- Two additional keep-ratio experiments: 1% and 3%.
 
-The standard `5% + 8 summaries + depth 4` configuration is reused as the
-center point and is not duplicated in each sweep.
+The standard `5% + 8 summaries + depth 4` configuration is included in the
+seven component combinations and is not duplicated.
 
 Run selected groups:
 

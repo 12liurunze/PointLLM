@@ -57,7 +57,7 @@ export DISABLE_POINT_SPATIAL_COMPRESSION=1
 unset POINT_TOKEN_KEEP_RATIOS
 unset POINT_SPATIAL_KEEP_RATIO POINT_SPATIAL_NUM_POINTS POINT_SPATIAL_MIN_POINTS
 
-ABLATION_GROUP_LIST="${ABLATION_GROUPS:-baseline,components,ratio,summary,depth}"
+ABLATION_GROUP_LIST="${ABLATION_GROUPS:-baseline,components,ratio}"
 KEEP_DATA="${KEEP_DATA:-0}"
 KEEP_HEADS="${KEEP_HEADS:-1}"
 MASTER_LOG="${RESULT_ROOT}/master.log"
@@ -268,8 +268,6 @@ fi
 if group_enabled ratio; then
   run_variant ratio_001 geometry,semantic,summary 0.01 8 4 0
   run_variant ratio_003 geometry,semantic,summary 0.03 8 4 0
-  run_variant ratio_010 geometry,semantic,summary 0.10 8 4 0
-  run_variant ratio_025 geometry,semantic,summary 0.25 8 4 0
 fi
 
 if group_enabled summary; then
